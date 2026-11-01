@@ -67,19 +67,41 @@ function AnimationSerializer:serialize(keyframeSequence: KeyframeSequence, rig: 
 	local maxTime = 0
 	local startTime = 0
 
-	-- Sort in-place for better performance, then set start time to earliest keyframe
+	-- Sort in place by time. Times stay absolute: shifting the first key to
+	-- zero used to move animations that intentionally start later.
 	table.sort(allKeyframes, function(a, b)
 		return (a :: any).Time < (b :: any).Time
 	end)
-	startTime = (allKeyframes[1] :: any).Time
 
-	-- Pre-cache common values to avoid repeated property access
-	local isDeformRig = rig.isDeformRig
+	-- A rig is a "deform" rig for Blender only when an animated channel is a
+	-- Bone. Any Bone anywhere (a dynamic head, an accessory) used to flip a
+	-- Motor6D rig into deform conversion on the Blender side.
+	local isDeformRig = false
 	local collectedCount = 0
+	local markers = {}
 
 	for i = 1, #allKeyframes do
 		local kf = allKeyframes[i]
 		if kf:IsA("Keyframe") then
+			-- Keyframe names and KeyframeMarkers travel to Blender as markers.
+			local keyframeTime = (kf :: any).Time - startTime
+			if kf.Name ~= "Keyframe" and kf.Name ~= "" then
+				table.insert(markers, { name = kf.Name, time = keyframeTime, type = "Name" })
+			end
+			local okMarkers, keyframeMarkers = pcall(function()
+				return (kf :: any):GetMarkers()
+			end)
+			if okMarkers and type(keyframeMarkers) == "table" then
+				for _, marker in ipairs(keyframeMarkers) do
+					table.insert(markers, {
+						name = marker.Name,
+						value = (marker :: any).Value,
+						time = keyframeTime,
+						type = "Event",
+					})
+				end
+			end
+
 			-- Pre-allocate state table as a proper dictionary
 			local state = {}
 			local faceState = {}
@@ -90,9 +112,13 @@ function AnimationSerializer:serialize(keyframeSequence: KeyframeSequence, rig: 
 				local pose = descendants[j]
 				if pose:IsA("Pose") then
 					local weight = (pose :: any).Weight
-					local isStructuralDeformRoot = isDeformRig
+					local isStructuralDeformRoot = rig.isDeformRig
 						and pose:GetAttribute("BlenderAnimationsStructuralRoot") == true
 					if not isStructuralDeformRoot and type(weight) == "number" and weight > 0 then
+						local channel = rig.bones and rig.bones[pose.Name]
+						if channel and typeof((channel :: any).part) == "Instance" and (channel :: any).part:IsA("Bone") then
+							isDeformRig = true
+						end
 						state[pose.Name] = {
 							components = { pose.CFrame:GetComponents() },
 							easingStyle = pose.EasingStyle.Name,
@@ -100,10 +126,12 @@ function AnimationSerializer:serialize(keyframeSequence: KeyframeSequence, rig: 
 						}
 					end
 				elseif pose:IsA("NumberPose") then
+					-- Keep the face control's own easing (it used to be replaced with Linear).
+					local numberPose = pose :: any
 					faceState[pose.Name] = {
-						value = pose.Value,
-						easingStyle = "Linear",
-						easingDirection = "Out",
+						value = numberPose.Value,
+						easingStyle = if numberPose.EasingStyle then numberPose.EasingStyle.Name else "Linear",
+						easingDirection = if numberPose.EasingDirection then numberPose.EasingDirection.Name else "Out",
 					}
 				end
 			end
@@ -145,6 +173,9 @@ function AnimationSerializer:serialize(keyframeSequence: KeyframeSequence, rig: 
 		is_deform_rig = isDeformRig,
 		is_deform_bone_rig = isDeformRig,
 	}
+	if #markers > 0 then
+		(result :: any).markers = markers
+	end
 
 	return result
 end

@@ -21,10 +21,28 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 
 
+def _fixture_path(filename):
+    """Studio-captured probes: tests/fixtures/, or the repo root (older layout).
+
+    They were never committed (the old .gitignore excluded *.rbxl), so skip
+    with a clear reason instead of failing on a fresh clone.
+    """
+    for directory in (
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures"),
+        _REPO_ROOT,
+    ):
+        path = os.path.join(directory, filename)
+        if os.path.exists(path):
+            return path
+    raise unittest.SkipTest(
+        f"{filename} is not in the repository; save it from Studio into tests/fixtures/ to run this test."
+    )
+
+
 def _load_grid(filename):
     from roblox_animations.core.rbxm import _parse_chunks
 
-    with open(os.path.join(_REPO_ROOT, filename), "rb") as handle:
+    with open(_fixture_path(filename), "rb") as handle:
         instances, _roots = _parse_chunks(handle.read())
     terrain = next(
         instance for instance in instances.values()

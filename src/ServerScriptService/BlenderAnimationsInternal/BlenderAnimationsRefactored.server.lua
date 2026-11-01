@@ -26,6 +26,7 @@ local MoreTab = require(script.Parent.UI.Tabs.MoreTab)
 local SharedComponents = require(script.Parent.UI.SharedComponents)
 local RigTabs = require(script.Parent.UI.Components.RigTabs)
 local RigSessionManager = require(script.Parent.RigSessionManager)
+local RigValidation = require(script.Parent.Components.RigValidation)
 
 local Plugin = plugin
 
@@ -175,24 +176,35 @@ local function cleanupAll()
 end
 
 
+-- Hint shown for the last selection that looked like a rig but can't be one.
+local lastSelectionHint: string? = nil
+
 -- Function to update the active rig based on the current selection in Studio
 local function updateActiveRigFromSelection()
 	if State.widgetsEnabled:get(true) and not State.isSelectionLocked:get() then
 		local selection = Selection:Get()
 		if #selection > 0 then
-			local selectedObject = selection[1]
+			local clicked = selection[1]
 
-			if rigManager:isKeyframeSequence(selectedObject) then
-				State.lastSelectionWasKeyframeSequence = true
+			if rigManager:isKeyframeSequence(clicked) then
+				-- Saved animations are played from the list; selecting one never
+				-- changes the rig. (This used to set a flag that swallowed the next
+				-- rig click.)
 				return
 			end
 
-			if rigManager:isValidRig(selectedObject) then
-				if State.lastSelectionWasKeyframeSequence then
-					State.lastSelectionWasKeyframeSequence = false
-					return
-				end
+			-- A clicked limb or tool part selects the rig it belongs to.
+			local selectedObject, hint = RigValidation.resolveRigFromSelection(clicked)
+			if lastSelectionHint and lastSelectionHint ~= hint then
+				rigManager:removeWarning(lastSelectionHint)
+				lastSelectionHint = nil
+			end
+			if hint then
+				lastSelectionHint = hint
+				rigManager:addWarning(hint)
+			end
 
+			if selectedObject then
 				if rigSessionManager:contains(selectedObject) then
 					RigTabs._switchToRig(services, selectedObject)
 					return
@@ -200,11 +212,18 @@ local function updateActiveRigFromSelection()
 
 				local currentRig = State.activeSessionRig:get()
 				if currentRig and not State.isAwaitingRigSelection:get() then
-					-- Outside explicit multi-rig selection, replace the sole session.
-					playbackService:stopRigTrack(currentRig)
-					rigSessionManager:remove(currentRig)
-					State.rigTabOrder:set({})
-					State.activeSessionRig:set(nil)
+					-- Outside explicit multi-rig selection, replace the sole session,
+					-- unless it holds an animation: then it stays open as a tab so
+					-- clicking another rig never throws work away.
+					local hasAnimation = State.animationDirty:get() or State.animationLength:get() > 0
+					if not hasAnimation then
+						playbackService:stopRigTrack(currentRig)
+						rigSessionManager:remove(currentRig)
+						State.rigTabOrder:set({})
+						State.activeSessionRig:set(nil)
+					else
+						rigSessionManager:saveActive()
+					end
 				end
 
 				rigSessionManager:createAndActivate(selectedObject)
@@ -227,8 +246,9 @@ local function updateActiveRigFromSelection()
 					end
 				end)
 			end
-		elseif #selection == 0 then
-			State.lastSelectionWasKeyframeSequence = false
+		elseif lastSelectionHint then
+			rigManager:removeWarning(lastSelectionHint)
+			lastSelectionHint = nil
 		end
 	end
 end
@@ -334,6 +354,10 @@ do -- Creates the plugin
 
 		-- Run cleanup synchronously to ensure stopAnimationAndDisconnect finishes before unload
 		cleanupAll()
+		-- Never leave export clones or meta parts in the place.
+		pcall(function()
+			services.exportManager:clearMetaParts()
+		end)
 
 		if State.selectionConnection then
 			State.selectionConnection:Disconnect()
@@ -417,6 +441,18 @@ do -- Creates the plugin
 	if typeof(rm) == "boolean" then State.reducedMotion:set(rm) end
     local sd = plugin:GetSetting("ShowDebugInfo")
     if typeof(sd) == "boolean" then State.showDebugInfo:set(sd) end
+
+    -- The Blender port used to reset to 31337 every session.
+    local savedPort = plugin:GetSetting("ServerPort")
+    if typeof(savedPort) == "number" and savedPort >= 1024 and savedPort <= 65534 then
+        State.serverPort:set(savedPort)
+    end
+    table.insert(
+        State.observers,
+        Observer(State.serverPort):onChange(function()
+            plugin:SetSetting("ServerPort", State.serverPort:get())
+        end)
+    )
     
     -- Auto-connect to Blender if enabled
     if State.autoConnectToBlender:get() then

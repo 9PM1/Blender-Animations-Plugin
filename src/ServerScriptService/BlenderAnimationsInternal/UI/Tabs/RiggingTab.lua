@@ -522,6 +522,28 @@ function RiggingTab.create(services: any)
 						}) :: any,
 					},
 				}),
+				-- One click to make the weapon animatable without equipping it.
+				Button({
+					LayoutOrder = 4,
+					Text = "Connect to Hand (Motor6D)",
+					Size = UDim2.new(1, 0, 0, 28),
+					Enabled = Computed(function()
+						local status = State.weaponConnectionStatus:get()
+						return State.selectedWeapon:get() ~= nil and not status:find(utf8.char(0x2713))
+					end),
+					Activated = function(): nil
+						services.exportManager:connectWeaponToHand()
+						return nil
+					end,
+					[OnEvent("MouseEnter")] = function()
+						weaponHint:set(
+							"Adds a Motor6D from the rig's right hand to the weapon, keeping it where it is (Ctrl+Z undoes it). Animations can then move the weapon. Your game must create the same Motor6D when it equips the weapon."
+						)
+					end,
+					[OnEvent("MouseLeave")] = function()
+						weaponHint:set("")
+					end,
+				}) :: any,
 				-- Separator
 				New("Frame")({
 					LayoutOrder = 4,

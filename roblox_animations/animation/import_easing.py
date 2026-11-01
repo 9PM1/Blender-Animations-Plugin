@@ -150,3 +150,73 @@ def sample_import_keyframes(keyframes, fps):
             poses[name] = [mat_to_cf(matrix), "Constant" if constant else "Linear", "Out"]
         result.append({"t": frame / fps, "kf": poses})
     return result
+
+
+def _decode_face_value(face):
+    """Studio sends a number or {value, easingStyle, easingDirection}."""
+    if isinstance(face, (int, float)):
+        return float(face), "Linear", "Out"
+    if isinstance(face, dict):
+        try:
+            value = float(face.get("value", 0.0))
+        except (TypeError, ValueError):
+            return None
+        return value, face.get("easingStyle", "Linear"), face.get("easingDirection", "Out")
+    return None
+
+
+def sample_face_control_tracks(keyframes, fps):
+    """Sample face-control (NumberPose) tracks at scene frames.
+
+    Times in ``keyframes`` are seconds. Returns ``{control: [(frame, value,
+    constant), ...]}`` with frames counted from the animation start. Easing is
+    evaluated with the same Roblox curves as poses, so imported sliders move
+    the way they did in Studio.
+    """
+    tracks = {}
+    for key in keyframes:
+        faces = key.get("fc") if isinstance(key, dict) else None
+        if not isinstance(faces, dict):
+            continue
+        try:
+            frame = float(key.get("t", 0.0)) * fps
+        except (TypeError, ValueError):
+            continue
+        if abs(frame - round(frame)) < 1e-6:
+            frame = float(round(frame))
+        for name, face in faces.items():
+            decoded = _decode_face_value(face)
+            if decoded is None or not isinstance(name, str):
+                continue
+            tracks.setdefault(name, {})[frame] = decoded
+
+    result = {}
+    for name, track in tracks.items():
+        frames = sorted(track)
+        samples = []
+        for index, frame in enumerate(frames):
+            value, style, direction = track[frame]
+            if index == len(frames) - 1:
+                samples.append((frame, value, True))
+                break
+            next_frame = frames[index + 1]
+            next_value = track[next_frame][0]
+            if style == "Constant":
+                if direction == "In":
+                    # Jumps to the next value immediately.
+                    samples.append((frame, value, True))
+                    samples.append((frame + min((next_frame - frame) / 4, 5e-4), next_value, True))
+                elif direction == "InOut":
+                    samples.append((frame, value, True))
+                    samples.append(((frame + next_frame) / 2, next_value, True))
+                else:
+                    samples.append((frame, value, True))
+                continue
+            samples.append((frame, value, False))
+            if style != "Linear":
+                for sample_frame in range(math.floor(frame) + 1, math.ceil(next_frame)):
+                    alpha = (sample_frame - frame) / (next_frame - frame)
+                    factor = pose_easing_value(style, direction, alpha)
+                    samples.append((float(sample_frame), value + (next_value - value) * factor, False))
+        result[name] = samples
+    return result

@@ -12,6 +12,29 @@ from bpy.types import AddonPreferences
 from . import operators, ui, server
 
 
+_CONTENT_DIR_CACHE = {"value": None, "checked_at": -1e9}
+
+
+def _cached_content_dir():
+    """Studio install lookup for the preferences panel.
+
+    draw() runs on every redraw; scanning the disk each time made the
+    preferences window stutter. Re-check at most every 30 seconds.
+    """
+    import time  # noqa: PLC0415
+
+    now = time.monotonic()
+    if now - _CONTENT_DIR_CACHE["checked_at"] > 30.0:
+        try:
+            from .rig.filemesh import detect_roblox_content_dir  # noqa: PLC0415
+
+            _CONTENT_DIR_CACHE["value"] = detect_roblox_content_dir()
+        except Exception:
+            _CONTENT_DIR_CACHE["value"] = None
+        _CONTENT_DIR_CACHE["checked_at"] = now
+    return _CONTENT_DIR_CACHE["value"]
+
+
 class RbxAnimationsPreferences(AddonPreferences):
     """Addon preferences for non-secret addon settings."""
 
@@ -39,12 +62,7 @@ class RbxAnimationsPreferences(AddonPreferences):
             text="Auto-Detect",
         )
         if not self.roblox_content_path:
-            try:
-                from .rig.filemesh import detect_roblox_content_dir
-
-                detected = detect_roblox_content_dir()
-            except Exception:
-                detected = None
+            detected = _cached_content_dir()
             if detected:
                 layout.label(
                     text=f"Detected: {detected}", icon="CHECKMARK"
@@ -275,12 +293,21 @@ def register():
             pass
         bpy.types.TOPBAR_MT_file_import.append(file_import_extend)
 
-        # Register request processing timer
-        if not bpy.app.timers.is_registered(server.process_pending_requests):
-            bpy.app.timers.register(server.process_pending_requests, persistent=True)
+        # Requests are served by the sync server's own timer while it runs;
+        # drop the always-on legacy queue timer left by older versions.
+        try:
+            if bpy.app.timers.is_registered(server.process_pending_requests):
+                bpy.app.timers.unregister(server.process_pending_requests)
+        except Exception:
+            pass
 
         _remove_blend_file_load_handlers()
         bpy.app.handlers.load_post.append(_on_blend_file_loaded)
+
+        # Keep Roblox joint offsets in step with Edit Mode bone edits.
+        from .rig import display_offsets
+
+        display_offsets.register_handlers()
 
     except Exception as e:
         print(f"Error registering Roblox Animations addon: {e}")
@@ -346,6 +373,13 @@ def unregister():
 
         try:
             _remove_blend_file_load_handlers()
+        except Exception:
+            pass
+
+        try:
+            from .rig import display_offsets
+
+            display_offsets.unregister_handlers()
         except Exception:
             pass
 

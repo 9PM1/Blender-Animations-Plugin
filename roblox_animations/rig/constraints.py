@@ -8,6 +8,7 @@ from ..core.utils import (
     find_parts_collection_in_master,
     get_object_by_name,
 )
+from .part_matching import _match_stem
 
 
 def link_object_to_bone_rigid(obj, ao, bone):
@@ -40,6 +41,12 @@ def _ensure_child_of_constraint(obj, armature, bone_name):
             else:
                 obj.constraints.remove(c)
     if not correct_constraint_found:
+        bone = armature.data.bones.get(bone_name)
+        if bone is not None:
+            # Same rest-relative inverse as link_object_to_bone_rigid, so the
+            # object stays exactly where it is instead of jumping.
+            link_object_to_bone_rigid(obj, armature, bone)
+            return
         constraint = obj.constraints.new(type="CHILD_OF")
         constraint.target = armature
         constraint.subtarget = bone_name
@@ -111,10 +118,10 @@ def auto_constraint_parts(armature_name, skip_objects=None, inst_ref_to_bone=Non
             bone_name = inst_ref_to_bone.get(int(ref))
             if not bone_name:
                 continue
-            if bone_name in used_bones:
-                continue
             if bone_name not in armature.data.bones:
                 continue
+            # The referent is authoritative: a part, its decals and anything
+            # else built from it all follow the same bone.
             used_bones.add(bone_name)
             _ensure_child_of_constraint(obj, armature, bone_name)
             matched_parts.append(obj.name)
@@ -127,16 +134,19 @@ def auto_constraint_parts(armature_name, skip_objects=None, inst_ref_to_bone=Non
             if obj in skip_objects:
                 continue
 
-            # Strip .001, .002 etc from name for matching
-            base_name = re.sub(r"\.\d+$", "", obj.name).lower()
+            # "<Model>.model/Head.Part.001" and "Head.001" both compare as "head".
+            base_name = _match_stem(obj.name)
             bone_candidates = bone_groups.get(base_name)
+            if not bone_candidates:
+                base_name = re.sub(r"\.\d+$", "", obj.name).lower()
+                bone_candidates = bone_groups.get(base_name)
             if not bone_candidates:
                 continue
 
-            # Filter out already-claimed bones
-            available = [b for b in bone_candidates if b not in used_bones]
-            if not available:
-                continue
+            # Prefer bones nothing claimed yet (left/right twins), but a second
+            # object for the same bone still gets attached instead of being
+            # left floating.
+            available = [b for b in bone_candidates if b not in used_bones] or list(bone_candidates)
 
             # Pick the best bone: closest to the mesh's world center
             if len(available) == 1:

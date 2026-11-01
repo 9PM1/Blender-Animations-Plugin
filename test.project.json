@@ -1,0 +1,19 @@
+{
+  "name": "project-tests",
+  "tree": {
+    "$className": "DataModel",
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "$ignoreUnknownInstances": true,
+      "BlenderAnimationsInternal": {
+        "$path": "src/ServerScriptService/BlenderAnimationsInternal",
+        "Packages": {
+          "$path": "Packages"
+        }
+      },
+      "TestRunner": {
+        "$path": "src/ServerScriptService/TestRunner.server.lua"
+      }
+    }
+  }
+}

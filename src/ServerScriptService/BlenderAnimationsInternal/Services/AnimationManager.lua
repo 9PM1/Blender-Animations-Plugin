@@ -8,6 +8,8 @@ local Utils = require(script.Parent.Parent.Utils)
 
 local AnimationSerializer = require(script.Parent.Parent.Components.AnimationSerializer)
 local AnimationSimplifier = require(script.Parent.Parent.Components.AnimationSimplifier)
+local MirrorNames = require(script.Parent.Parent.Components.MirrorNames)
+local Undo = require(script.Parent.Parent.Components.Undo)
 local SelectionService = game:GetService("Selection")
 
 local AnimationManager = {}
@@ -602,13 +604,9 @@ local function applySimplifier(animData)
 	return animData
 end
 
+-- Whole words only: "LeftUpperArm" mirrors, "Leftovers" doesn't.
 local function mirrorBoneName(name: string): string
-	local mirrored = name:gsub("Left", "__RBX_MIRROR_LEFT__")
-	mirrored = mirrored:gsub("Right", "Left")
-	mirrored = mirrored:gsub("__RBX_MIRROR_LEFT__", "Right")
-	mirrored = mirrored:gsub("left", "__rbx_mirror_left__")
-	mirrored = mirrored:gsub("right", "left")
-	return mirrored:gsub("__rbx_mirror_left__", "right")
+	return MirrorNames.mirror(name)
 end
 
 local function componentsToCFrame(components: any): CFrame?
@@ -655,6 +653,14 @@ local function applyMirror(animData)
 				mirroredPoses[mirroredName] = mirroredPose
 			end
 			keyframe.kf = mirroredPoses
+		end
+		-- Face controls have sides too (LeftEyeClosed <-> RightEyeClosed).
+		if type(keyframe) == "table" and type(keyframe.fc) == "table" then
+			local mirroredFaces = {}
+			for controlName, value in pairs(keyframe.fc) do
+				mirroredFaces[if type(controlName) == "string" then mirrorBoneName(controlName) else controlName] = value
+			end
+			keyframe.fc = mirroredFaces
 		end
 	end
 
@@ -775,6 +781,34 @@ local function applySpeed(animData)
 	return animData
 end
 
+-- The modifiers that change what Save/Upload/Send-to-Blender produce.
+function AnimationManager.activeModifierNames(): { string }
+	local names = {}
+	if State.mirrorAnimationEnabled:get() then
+		table.insert(names, "Mirror")
+	end
+	if State.speedEnabled:get() and State.speedMultiplier:get() ~= 1 then
+		table.insert(names, string.format("Speed x%.2f", State.speedMultiplier:get()))
+	end
+	if State.resampleEnabled:get() then
+		table.insert(names, string.format("Resample %d fps", math.round(State.resampleFps:get())))
+	end
+	if State.simplifierEnabled:get() and State.simplifierStrength:get() > 0 then
+		table.insert(names, string.format("Simplify %d%%", State.simplifierStrength:get()))
+	end
+	if State.scaleFactor:get() ~= 1 then
+		table.insert(names, string.format("Scale x%.2f", State.scaleFactor:get()))
+	end
+	return names
+end
+
+local function announceModifiers(action: string)
+	local names = AnimationManager.activeModifierNames()
+	if #names > 0 then
+		print(string.format("[AnimationManager] %s includes these modifiers: %s", action, table.concat(names, ", ")))
+	end
+end
+
 local function getSpeedAdjustedKeyframeNames(): { any }
 	local keyframeNames = State.keyframeNames:get()
 	local speed = math.clamp(State.speedMultiplier:get(), 0.05, 10)
@@ -807,6 +841,83 @@ local function deepCopy(t: any): any
 		copy[deepCopy(k)] = deepCopy(v)
 	end
 	return copy
+end
+
+local function preview(names: { string }, limit: number): string
+	local shown = {}
+	for index = 1, math.min(#names, limit) do
+		shown[index] = names[index]
+	end
+	local text = table.concat(shown, ", ")
+	if #names > limit then
+		text ..= string.format(" (+%d more)", #names - limit)
+	end
+	return text
+end
+
+-- Show what the rig couldn't use and what Blender warned about, instead of
+-- dropping channels silently.
+function AnimationManager:reportLoadProblems(animData: any)
+	local rigManager = (State :: any).rigManager
+	local function show(message: string)
+		warn("[AnimationManager] " .. message)
+		if rigManager and rigManager.addWarning then
+			rigManager:addWarning(message)
+		end
+	end
+	local rig = State.activeRig :: any
+	local report = rig and rig.lastLoadReport
+	if type(report) == "table" then
+		if type(report.unmatched) == "table" and #report.unmatched > 0 then
+			show(
+				string.format(
+					"%d animated bone(s) have no matching part in this rig and were skipped: %s. If they're new bones, use Sync Bones; if they were renamed in Blender, rename them back.",
+					#report.unmatched,
+					preview(report.unmatched, 6)
+				)
+			)
+		end
+		if type(report.ambiguous) == "table" and #report.ambiguous > 0 then
+			show(
+				"Skipped animation for names shared by several parts: "
+					.. preview(report.ambiguous, 6)
+					.. ". Rename the duplicates in the rig."
+			)
+		end
+	end
+	local exportInfo = if type(animData) == "table" then animData.export_info else nil
+	if type(exportInfo) == "table" and type(exportInfo.warnings) == "table" then
+		for _, message in ipairs(exportInfo.warnings) do
+			if type(message) == "string" then
+				show("Blender: " .. message)
+			end
+		end
+	end
+end
+
+-- Markers Blender sent back (pose markers) replace the Studio list.
+local function applyMarkersFromBlender(animData: any)
+	if type(animData) ~= "table" or type(animData.markers) ~= "table" or #animData.markers == 0 then
+		return
+	end
+	local names = {}
+	for _, marker in ipairs(animData.markers) do
+		if type(marker) == "table" and type(marker.name) == "string" and type(marker.time) == "number" then
+			table.insert(names, {
+				name = marker.name,
+				time = marker.time,
+				value = if type(marker.value) == "string" then marker.value else "",
+				type = if marker.type == "Event" then "Event" else "Name",
+			})
+		end
+	end
+	if #names > 0 then
+		State.keyframeNames:set(names)
+		local rig = State.activeRig :: any
+		if rig then
+			rig.keyframeNames = names
+		end
+	end
 end
 
 function AnimationManager:loadAnim(data: string, isBinary: boolean, progressContext: LoadingProgressContext?)
@@ -867,6 +978,9 @@ function AnimationManager:loadAnim(data: string, isBinary: boolean, progressCont
 	if not _loadSuccess then
 		error("Animation loading failed: " .. tostring(loadError))
 	end
+
+	applyMarkersFromBlender(animData)
+	self:reportLoadProblems(animData)
 
 	if progressContext then
 		progressContext:set(1, "Animation data applied", "building preview animation", true)
@@ -1520,6 +1634,13 @@ function AnimationManager:saveAnimationRig()
 		warn("No active rig model set.")
 		return
 	end
+	announceModifiers("The saved animation")
+	return Undo.record("Save animation to rig", function()
+		return self:_saveAnimationRigImpl()
+	end)
+end
+
+function AnimationManager:_saveAnimationRigImpl()
 
 	local kfs = self:createKeyframeSequenceFromState()
 	if not kfs then
@@ -1580,6 +1701,13 @@ function AnimationManager:saveAnimationFolder(name: string)
 		warn("No active rig model set.")
 		return
 	end
+	announceModifiers("The saved animation")
+	return Undo.record("Save animation to folder", function()
+		return self:_saveAnimationFolderImpl(name)
+	end)
+end
+
+function AnimationManager:_saveAnimationFolderImpl(name: string)
 
 	local folder = game.Workspace:FindFirstChild("Imported Animations Folder")
 
@@ -1616,6 +1744,7 @@ function AnimationManager:uploadAnimation()
 		return
 	end
 
+	announceModifiers("The uploaded animation")
 	local kfs = self:createKeyframeSequenceFromState()
 	if not kfs then
 		return

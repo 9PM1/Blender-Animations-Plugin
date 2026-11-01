@@ -93,13 +93,20 @@ def _clear_fk_fcurves_for_ik_chains(ao: bpy.types.Object) -> None:
     to_clear = chains - protected
     if not to_clear:
         return
-    fcurves = list(getattr(action, "fcurves", []) or [])
-    for fc in fcurves:
-        dp = getattr(fc, "data_path", "")
-        for name in to_clear:
-            if dp.startswith(f'pose.bones["{bpy.utils.escape_identifier(name)}"]'):
-                action.fcurves.remove(fc)
-                break
+    # Blender 4.4+ keeps F-Curves in slot channelbags; action.fcurves is gone in 5.0.
+    try:
+        fcurves = get_action_fcurves(
+            action,
+            slot=get_animation_data_action_slot(ao.animation_data, action=action),
+        )
+    except Exception:
+        return
+    prefixes = tuple(
+        f'pose.bones["{bpy.utils.escape_identifier(name)}"]' for name in to_clear
+    )
+    for fc in list(fcurves):
+        if getattr(fc, "data_path", "").startswith(prefixes):
+            fcurves.remove(fc)
 
 
 def import_animation_preserve_ik(import_fn, *args, **kwargs):

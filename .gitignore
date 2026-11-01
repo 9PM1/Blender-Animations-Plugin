@@ -41,7 +41,9 @@ tasks/
 *.lock
 
 # Backup files
-*old*.lua
+# Backups only: '*old*' also matched names like Placeholder.lua or Folder.lua.
+*_old.lua
+*.old.lua
 *.backup
 backup.py
 *.bak
@@ -57,7 +59,8 @@ tools/
 
 # Temporary files
 *wally
-*.txt
+# Root scratch notes only; .txt files elsewhere can be real (test data, docs).
+/*.txt
 *.zip
 *.tmp
 *.temp
@@ -77,6 +80,11 @@ parts.mtl
 
 *pyrightconfig.json
 *ruff.toml
-_*.py
+# Root scratch scripts only: '_*.py' also matched every __init__.py.
+/_*.py
 
 Sample Rigs/
+
+# Keep these even though the broad patterns above match them.
+!wally.lock
+!roblox_animations/tests/fixtures/**

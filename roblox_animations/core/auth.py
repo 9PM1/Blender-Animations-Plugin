@@ -443,60 +443,85 @@ def cancel_login() -> None:
 # ---------------------------------------------------------------------------
 
 
+class _CallbackContext:
+    """What one login attempt needs to finish the OAuth redirect."""
+
+    def __init__(self, state, client_id, verifier, redirect_uri, done):
+        self.expected_state = state
+        self.client_id = client_id
+        self.verifier = verifier
+        self.redirect_uri = redirect_uri
+        self.done = done
+
+
+# Set while a login waits for its redirect on the running sync server (both
+# use port 31337, which is the redirect URI registered with Roblox).
+_shared_callback_context: Optional[_CallbackContext] = None
+
+
+def _process_callback(path: str, ctx: _CallbackContext):
+    """Handle the OAuth redirect. Returns (HTTP status, message)."""
+    parsed = urlparse(path)
+    if parsed.path != _REDIRECT_PATH:
+        return 404, "Not found"
+
+    params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+
+    # CSRF check
+    if params.get("state") != ctx.expected_state:
+        _login_result["error"] = "State mismatch — possible CSRF attack."
+        ctx.done.set()
+        return 400, "State mismatch. Please try logging in again."
+
+    # Authorization server error
+    error = params.get("error")
+    if error:
+        desc = params.get("error_description", error)
+        _login_result["error"] = desc
+        ctx.done.set()
+        return 400, f"Authorization error: {desc}"
+
+    code = params.get("code")
+    if not code:
+        _login_result["error"] = "No authorization code in callback."
+        ctx.done.set()
+        return 400, "No authorization code received."
+
+    # Exchange code for tokens
+    try:
+        token_data = _token_post(
+            _TOKEN_URL,
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": ctx.client_id,
+                "code_verifier": ctx.verifier,
+                "redirect_uri": ctx.redirect_uri,
+            },
+        )
+        _login_result["token_data"] = token_data
+        return 200, "Authorization complete. You can close this window."
+    except Exception as exc:
+        _login_result["error"] = str(exc)
+        return 500, f"Token exchange failed: {exc}"
+    finally:
+        ctx.done.set()
+
+
+def handle_shared_callback(path: str):
+    """Entry point for the sync server when it owns the callback port."""
+    ctx = _shared_callback_context
+    if ctx is None:
+        return 404, "No Roblox login is waiting for this redirect."
+    return _process_callback(path, ctx)
+
+
 class _CallbackHandler(BaseHTTPRequestHandler):
     """Minimal HTTP handler that receives the OAuth2 redirect."""
 
     def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path != _REDIRECT_PATH:
-            self._send(404, "Not found")
-            return
-
-        params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-
-        # CSRF check
-        if params.get("state") != self.server._expected_state:
-            _login_result["error"] = "State mismatch — possible CSRF attack."
-            self._send(400, "State mismatch. Please try logging in again.")
-            self.server._done.set()
-            return
-
-        # Authorization server error
-        error = params.get("error")
-        if error:
-            desc = params.get("error_description", error)
-            _login_result["error"] = desc
-            self._send(400, f"Authorization error: {desc}")
-            self.server._done.set()
-            return
-
-        code = params.get("code")
-        if not code:
-            _login_result["error"] = "No authorization code in callback."
-            self._send(400, "No authorization code received.")
-            self.server._done.set()
-            return
-
-        # Exchange code for tokens
-        try:
-            redirect_uri = self.server._redirect_uri
-            token_data = _token_post(
-                _TOKEN_URL,
-                {
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "client_id": self.server._client_id,
-                    "code_verifier": self.server._verifier,
-                    "redirect_uri": redirect_uri,
-                },
-            )
-            _login_result["token_data"] = token_data
-            self._send(200, "Authorization complete. You can close this window.")
-        except Exception as exc:
-            _login_result["error"] = str(exc)
-            self._send(500, f"Token exchange failed: {exc}")
-        finally:
-            self.server._done.set()
+        status, text = _process_callback(self.path, self.server._context)
+        self._send(status, text)
 
     def _send(self, code: int, text: str) -> None:
         body = text.encode("utf-8")
@@ -510,6 +535,14 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         pass
 
 
+def _sync_server_owns_callback_port() -> bool:
+    try:
+        from ..server import server as sync_server  # noqa: PLC0415
+    except Exception:
+        return False
+    return bool(sync_server.server_should_run and sync_server.server_port == _PORT)
+
+
 def _login_worker(
     client_id: str,
     verifier: str,
@@ -517,8 +550,24 @@ def _login_worker(
     redirect_uri: str,
     server_ready: threading.Event,
 ) -> None:
-    """Background thread: start the callback server and wait for the redirect."""
+    """Background thread: receive the redirect and wait for it."""
+    global _shared_callback_context
+
     done_event = threading.Event()
+    context = _CallbackContext(state, client_id, verifier, redirect_uri, done_event)
+
+    if _sync_server_owns_callback_port():
+        # The sync server already listens on the redirect port; it forwards
+        # /oauth2/callback here instead of us binding a second socket.
+        _shared_callback_context = context
+        server_ready.set()
+        try:
+            while not done_event.is_set() and not _login_cancel.is_set():
+                done_event.wait(0.5)
+        finally:
+            _shared_callback_context = None
+            _login_done.set()
+        return
 
     try:
         server = HTTPServer(("localhost", _PORT), _CallbackHandler)
@@ -531,11 +580,7 @@ def _login_worker(
         _login_done.set()
         return
 
-    server._expected_state = state
-    server._client_id = client_id
-    server._verifier = verifier
-    server._redirect_uri = redirect_uri
-    server._done = done_event
+    server._context = context
     server.timeout = 1.0  # poll interval so we can detect cancellation
 
     server_ready.set()  # server is bound — safe to open the browser now

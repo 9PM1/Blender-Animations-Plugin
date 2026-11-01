@@ -1,5 +1,6 @@
 --!strict
 -- I moved all the playback logic here to make it easier to manage.
+local Undo = require(script.Parent.Parent.Components.Undo)
 local PlaybackService = {}
 PlaybackService.__index = PlaybackService
 
@@ -390,12 +391,15 @@ function PlaybackService:playCurrentAnimation(activeAnimator, kfsOverride)
 
 	local animator = activeAnimator:FindFirstChildOfClass("Animator")
 	if not animator and self.State.activeRigModel then
-		local newAnimator = Instance.new("Animator")
 		local parent = self.State.activeRigModel:FindFirstChildWhichIsA("Humanoid")
 			or self.State.activeRigModel:FindFirstChildWhichIsA("AnimationController")
 		if parent then
-			newAnimator.Parent = parent
-			animator = newAnimator
+			-- Adding an Animator changes the place; make it undoable.
+			animator = Undo.record("Add Animator for preview", function()
+				local newAnimator = Instance.new("Animator")
+				newAnimator.Parent = parent
+				return newAnimator
+			end)
 		end
 	end
 
@@ -424,7 +428,28 @@ function PlaybackService:playCurrentAnimation(activeAnimator, kfsOverride)
 	if not kfsOverride and self.State.scaleFactor:get() ~= 1 then
 		kfs = Utils.scaleAnimation(kfs, self.State.scaleFactor:get())
 	end
+	local previousSequence = self.State.currentKeyframeSequence
 	self.State.currentKeyframeSequence = kfs
+	-- Each rebuild makes a new preview sequence; free the old one unless
+	-- another rig's session still points at it.
+	if previousSequence and previousSequence ~= kfs and previousSequence.Parent == nil then
+		local activeRig = self.State.activeSessionRig and self.State.activeSessionRig:get()
+		local stillUsed = false
+		for rig, snapshot in pairs(self.State.rigSessions or {}) do
+			if snapshot.currentKeyframeSequence == previousSequence then
+				if rig == activeRig then
+					snapshot.currentKeyframeSequence = kfs
+				else
+					stillUsed = true
+				end
+			end
+		end
+		if not stillUsed then
+			pcall(function()
+				previousSequence:Destroy()
+			end)
+		end
+	end
 
 	self.State.animationLength:set(Utils.getRealKeyframeDuration(kfs:GetKeyframes()))
 	local animID = AnimationClipProvider:RegisterAnimationClip(kfs)
@@ -468,7 +493,7 @@ function PlaybackService:playCurrentAnimation(activeAnimator, kfsOverride)
 	playAnimation()
 	local playbackToken = self._playbackToken :: number
 
-	local lastStepTime = tick()
+	local lastStepTime = os.clock()
 
 	self:disconnectHeartbeat()
 	self.State.heartbeat.conn = RunService.Heartbeat:Connect(function(step)
@@ -476,7 +501,7 @@ function PlaybackService:playCurrentAnimation(activeAnimator, kfsOverride)
 			return
 		end
 
-		local currentTime = tick()
+		local currentTime = os.clock()
 		local delta = currentTime - lastStepTime
 		lastStepTime = currentTime
 
@@ -689,7 +714,7 @@ function PlaybackService:playAllRigs()
 
 	replayAll()
 	local playbackToken = self._playbackToken :: number
-	local lastStepTime = tick()
+	local lastStepTime = os.clock()
 
 	self:disconnectHeartbeat()
 	self.State.heartbeat.conn = RunService.Heartbeat:Connect(function(step)
@@ -697,7 +722,7 @@ function PlaybackService:playAllRigs()
 			return
 		end
 
-		local currentTime = tick()
+		local currentTime = os.clock()
 		local delta = currentTime - lastStepTime
 		lastStepTime = currentTime
 

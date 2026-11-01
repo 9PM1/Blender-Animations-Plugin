@@ -108,6 +108,13 @@ def _deferred_state(job_future_done):
 class LazyQueueTortureTests(unittest.TestCase):
     """Drive the real tick function through every queue gap in one pass."""
 
+    def setUp(self):
+        # The hydration audit scans every material in the file. Run in the
+        # full suite, materials left by earlier tests (deliberately image-less
+        # fixtures) made this test fail although its own queue was clean.
+        for material in list(bpy.data.materials):
+            bpy.data.materials.remove(material)
+
     def _pump(self, state, max_ticks=400):
         ticks = 0
         while ticks < max_ticks and (

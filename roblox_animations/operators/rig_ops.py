@@ -145,7 +145,13 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
         return {"FINISHED"}
 
     def invoke(self, context, event):
-        self.pr_rigging_type = "LOCAL_YAXIS_EXTEND"
+        # One default for every way a rig gets built (the .rbxm import uses
+        # "Connect"); a rebuild reuses the style the armature was built with.
+        self.pr_rigging_type = "CONNECT"
+        active = context.active_object
+        stored_type = active.get("rbx_rigging_type") if active is not None else None
+        if stored_type in {"RAW", "LOCAL_AXIS_EXTEND", "LOCAL_YAXIS_EXTEND", "CONNECT"}:
+            self.pr_rigging_type = stored_type
 
         wm = context.window_manager
 

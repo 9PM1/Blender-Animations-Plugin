@@ -183,7 +183,14 @@ def resolve_clothing_template_id(asset_id) -> Optional[str]:
         numeric = extract_asset_id(result)
         if numeric is not None and "rbxassetid" not in str(result).lower():
             result = f"rbxassetid://{numeric}"
-    _TEMPLATE_ID_CACHE[asset_id] = result
+    if result is not None:
+        # Failures are not cached: a login or network fix should work on the
+        # next import without restarting Blender.
+        _TEMPLATE_ID_CACHE[asset_id] = result
+    else:
+        record_clothing_problem(
+            f"Couldn't read the clothing asset {asset_id} (needs a Roblox login and network)."
+        )
     return result
 
 
@@ -452,6 +459,60 @@ def _context_cache_tag() -> tuple:
         _CLOTHING_CONTEXT.get("face_transparency"),
         color_items,
     )
+
+
+_CLOTHING_PROBLEMS: list = []
+
+
+def record_clothing_problem(message: str) -> None:
+    if message not in _CLOTHING_PROBLEMS:
+        _CLOTHING_PROBLEMS.append(message)
+
+
+def take_clothing_problems() -> list:
+    """Problems since the last call (for the import report)."""
+    problems = list(_CLOTHING_PROBLEMS)
+    _CLOTHING_PROBLEMS.clear()
+    return problems
+
+
+_ENTRY_CONTEXT_KEYS = ("shirt_template", "pants_template", "face_texture", "body_colors", "face_transparency")
+
+
+class entry_clothing_context:
+    """Use a part's own rig clothing while baking it.
+
+    Files with several characters stamp each rig's shirt, pants, face and
+    body colours on its parts; the import-wide context only holds one set.
+    Bake caches key on the context contents, so swapping is safe.
+    """
+
+    def __init__(self, entry):
+        self._entry = entry or {}
+        self._saved = None
+
+    def __enter__(self):
+        if not any(key in self._entry for key in _ENTRY_CONTEXT_KEYS):
+            return self
+        self._saved = {key: _CLOTHING_CONTEXT.get(key) for key in _ENTRY_CONTEXT_KEYS}
+        for key in ("shirt_template", "pants_template", "face_texture"):
+            if key in self._entry:
+                _CLOTHING_CONTEXT[key] = self._entry.get(key)
+        if "body_colors" in self._entry:
+            _CLOTHING_CONTEXT["body_colors"] = dict(self._entry.get("body_colors") or {})
+        if "face_transparency" in self._entry:
+            try:
+                _CLOTHING_CONTEXT["face_transparency"] = max(
+                    0.0, min(1.0, float(self._entry.get("face_transparency") or 0.0))
+                )
+            except (TypeError, ValueError):
+                pass
+        return self
+
+    def __exit__(self, *exc_info):
+        if self._saved is not None:
+            _CLOTHING_CONTEXT.update(self._saved)
+        return False
 
 
 def set_clothing_context(shirt_template=None, pants_template=None, face_texture=None, body_colors=None, face_transparency=None):
@@ -982,7 +1043,7 @@ def _r6_clothing_canvas_np(np, template_provider):
         tpl, tw, th, has_alpha = template
         tpl = _decode_rgb(tpl)
         _rasterize_layer_over(buf, w, h, lookup, tpl, tw, th, has_alpha)
-    _R6_CLOTHING_CACHE["canvas"] = buf
+    _R6_CLOTHING_CACHE[("canvas", _context_cache_tag())] = buf
     return buf
 
 
@@ -990,8 +1051,9 @@ def _r6_clothing_canvas(template_provider):
     """Shared RGBA canvas holding pants (layer 1) then shirt (layer 2),
     projected through the full-canvas R6 guides. Transparent where no
     clothing covers. Cached once per import."""
-    if "canvas" in _R6_CLOTHING_CACHE:
-        return _R6_CLOTHING_CACHE["canvas"]
+    canvas_key = ("canvas", _context_cache_tag())
+    if canvas_key in _R6_CLOTHING_CACHE:
+        return _R6_CLOTHING_CACHE[canvas_key]
     np = _numpy()
     if np is not None:
         return _r6_clothing_canvas_np(np, template_provider)
@@ -1015,7 +1077,7 @@ def _r6_clothing_canvas(template_provider):
         tpl, tw, th, has_alpha = template
         tpl = _decode_rgb(tpl)
         _rasterize_layer_over(buf, w, h, lookup, tpl, tw, th, has_alpha)
-    _R6_CLOTHING_CACHE["canvas"] = buf
+    _R6_CLOTHING_CACHE[("canvas", _context_cache_tag())] = buf
     return buf
 
 
@@ -1294,6 +1356,7 @@ def get_limb_texture(part_name: str, body_rgba=None, tint_ref=None):
             image = _bake_head_image(body_rgb, tint_ref=tint_ref)
         except Exception as exc:
             print(f"[RbxClothing] head bake failed: {exc}")
+            record_clothing_problem(f"Clothing bake failed: {exc}")
             image = None
         _BAKE_CACHE[cache_key] = image
         return image
@@ -1310,6 +1373,7 @@ def get_limb_texture(part_name: str, body_rgba=None, tint_ref=None):
             image = _bake_r6_limb_image(r6_limb, body_rgb)
         except Exception as exc:
             print(f"[RbxClothing] R6 bake failed for '{r6_limb}': {exc}")
+            record_clothing_problem(f"Clothing bake failed: {exc}")
             image = None
         _BAKE_CACHE[cache_key] = image
         return image
@@ -1324,6 +1388,7 @@ def get_limb_texture(part_name: str, body_rgba=None, tint_ref=None):
         image = _bake_group_image(group, body_rgb)
     except Exception as exc:
         print(f"[RbxClothing] bake failed for '{group}': {exc}")
+        record_clothing_problem(f"Clothing bake failed: {exc}")
         image = None
     _BAKE_CACHE[cache_key] = image
     return image

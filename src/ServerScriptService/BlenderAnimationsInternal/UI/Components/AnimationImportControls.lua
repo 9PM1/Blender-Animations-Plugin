@@ -155,11 +155,16 @@ local function createBlenderSyncSection(services: any, layoutOrder: number, sele
 				end),
 				LayoutOrder = 2,
 				[OnChange("Text")] = function(newPort)
+					-- Validated as you type, but only one message, removed once the port
+					-- is valid (each keystroke of "40000" used to add another warning).
+					-- Live sync also uses the next port up, so 65534 is the highest.
+					local message = "Invalid port number. Enter a number between 1024 and 65534 (the same port as in Blender)."
 					local port = tonumber(newPort)
-					if port and port >= 1024 and port <= 65535 then
+					if port and port >= 1024 and port <= 65534 and port % 1 == 0 then
+						services.rigManager:removeWarning(message)
 						State.serverPort:set(port)
-					else
-						services.rigManager:addWarning("Invalid port number. Please enter a number between 1024 and 65535.")
+					elseif newPort ~= "" and #newPort >= 4 then
+						services.rigManager:addWarning(message)
 					end
 				end,
 			}),

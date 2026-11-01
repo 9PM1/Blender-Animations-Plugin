@@ -308,7 +308,9 @@ def build_bake_plan(
     Mutates ``keyframe_times`` by adding discovered explicit key times.
     """
     # Pre-compile regex for performance.
-    bone_name_pattern = re.compile(r'pose\.bones\["(.+?)"\]')
+    from ..core.utils import POSE_BONE_PATH_PATTERN  # noqa: PLC0415
+
+    bone_name_pattern = POSE_BONE_PATH_PATTERN
 
     dense_interpolation_segments: Dict[str, Set[Tuple[float, float]]] = defaultdict(set)
     adaptive_frames = set()

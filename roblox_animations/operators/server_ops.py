@@ -20,13 +20,21 @@ class StartServerOperator(bpy.types.Operator):
             if start_server(port):
                 self.report({"INFO"}, f"Server started on port {port}")
                 # Force UI refresh
-                for area in context.screen.areas:
+                screen = getattr(context, "screen", None)
+                for area in getattr(screen, "areas", ()):
                     if area.type == "VIEW_3D":
                         area.tag_redraw()
             else:
-                self.report({"ERROR"}, "Failed to start server - port may be in use")
+                from ..server import server as server_module  # noqa: PLC0415
+
+                self.report(
+                    {"ERROR"},
+                    server_module.last_start_error or "Failed to start the sync server.",
+                )
+                return {"CANCELLED"}
         except Exception as e:
             self.report({"ERROR"}, f"Error starting server: {str(e)}")
+            return {"CANCELLED"}
         return {"FINISHED"}
 
 

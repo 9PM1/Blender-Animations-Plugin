@@ -2014,12 +2014,27 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
             if special is not None:
                 mesh_id = _content_to_str(_first_prop(special, "MeshId"))
                 is_builtin_mesh_type = False
+                mesh_type = _first_prop(special, "MeshType")
+                mesh_type = int(mesh_type) if isinstance(mesh_type, (int, float)) else -1
                 if not mesh_id:
-                    mesh_type = _first_prop(special, "MeshType")
-                    mesh_id = _BUILTIN_MESHTYPE_IDS.get(
-                        int(mesh_type) if isinstance(mesh_type, (int, float)) else -1
-                    ) or ""
+                    mesh_id = _BUILTIN_MESHTYPE_IDS.get(mesh_type) or ""
                     is_builtin_mesh_type = bool(mesh_id)
+                if not mesh_id and mesh_type in _SPECIAL_MESH_PRIMITIVES:
+                    # Brick/Sphere/Cylinder/Wedge SpecialMeshes render a
+                    # primitive of Size * Scale. They used to get neither a
+                    # mesh nor a shape and vanished on import.
+                    shape, axis = _SPECIAL_MESH_PRIMITIVES[mesh_type]
+                    part_size = entry.get("part_size") or [1.0, 1.0, 1.0]
+                    mesh_scale = _vec3(_first_prop(special, "Scale")) or [1.0, 1.0, 1.0]
+                    entry["shape"] = shape
+                    entry["primitive_size"] = [
+                        float(part_size[index]) * float(mesh_scale[index]) for index in range(3)
+                    ]
+                    if axis:
+                        entry["primitive_axis"] = axis
+                elif not mesh_id:
+                    # An empty FileMesh renders nothing in Roblox either.
+                    entry["empty_special_mesh"] = True
                 if mesh_id:
                     entry["mesh_class"] = "MeshPart"
                     entry["mesh_id"] = mesh_id
@@ -2227,7 +2242,14 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
                 and inst.class_name == "Part"
                 and not has_custom_look
             ):
-                entry["face_decal"] = dict(decals[0])
+                # The face is the Front (NormalId 5) decal; other head decals
+                # stay separate decals instead of being dropped.
+                face_index = next(
+                    (index for index, decal in enumerate(decals) if int(decal.get("face", 5)) == 5),
+                    0,
+                )
+                entry["face_decal"] = dict(decals[face_index])
+                entry["face_decal_index"] = face_index
                 # The classic baked head mesh (rbxasset://fonts/head.mesh,
                 # SpecialShape HEAD_MESH) is the ONLY head the engine scales
                 # by (min(sx,sz), sy, min(sx,sz)) / 1.25 with the cylinder-cap
@@ -2274,6 +2296,16 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
 
     return entries
 
+
+# SpecialMesh.MeshType values that render a primitive of Size * Scale:
+# (shape for primitive_shapes, axis override). Roblox's SpecialMesh cylinder
+# runs along Y, unlike the X-axis Part cylinder.
+_SPECIAL_MESH_PRIMITIVES = {
+    2: ("wedge", None),     # Wedge
+    3: ("ball", None),      # Sphere
+    4: ("cylinder", "y"),   # Cylinder
+    6: ("block", None),     # Brick
+}
 
 # Builtin FileMesh assets for parametric SpecialMesh types (empty MeshId).
 # Head=0 and Torso=1 are the only MeshTypes backed by a real .mesh file.
@@ -2509,6 +2541,8 @@ def _build_rig_tree(instances: Dict[int, _Instance], roots: Dict[int, _Instance]
             "pname": None,
             "inst_ref": part_ref,
             "transform": _cf(_first_prop(part, "CFrame")),
+            # Used to point leaf bones along the part instead of diagonally.
+            "partSize": _vec3(_first_prop(part, "size", "Size")),
             "children": [],
             "aux": [],
             "auxTransform": [],

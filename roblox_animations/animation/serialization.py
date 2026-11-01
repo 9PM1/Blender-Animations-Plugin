@@ -10,6 +10,7 @@ Pipeline stages:
   emit    - convert the typed keyframe IR into plain JSON payloads
 """
 
+import json
 import math
 import re
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from mathutils import Matrix
 
 from ..core.constants import get_transform_to_blender, identity_cf
 from ..core.utils import (
+    POSE_BONE_PATH_PATTERN,
     get_action_fcurves,
     get_animation_data_action_slot,
     get_scene_fps,
@@ -227,12 +229,162 @@ def extract_bone_hierarchy(armature: "bpy.types.Object") -> Dict[str, Optional[s
     for bone in armature.data.bones:
         if is_face_control_bone(bone):
             continue
-        if bone.parent:
-            hierarchy[bone.name] = bone.parent.name
-        else:
-            hierarchy[bone.name] = None
+        # Studio resolves these by its own part/bone names.
+        name = export_channel_name(bone)
+        hierarchy[name] = export_channel_name(bone.parent) if bone.parent else None
 
     return hierarchy
+
+
+def export_channel_name(bone) -> str:
+    """The Roblox name a bone's animation channel is sent under.
+
+    Blender names can differ from the Roblox part: duplicates get ".001",
+    names over 63 bytes are truncated, and users rename bones. The rig stores
+    the original in ``rbx_source_name``. Structural twins (renamed because a
+    deform bone shares the name) keep their Blender name.
+    """
+    data = getattr(bone, "bone", bone)
+    name = getattr(data, "name", "")
+    if name.startswith("__RBX_STRUCTURAL__"):
+        return name
+    source = data.get("rbx_source_name") if hasattr(data, "get") else None
+    return source if isinstance(source, str) and source else name
+
+
+def _remap_channel_names(ao, keyframe_payloads):
+    """Rename Motor6D channels from Blender bone names to Roblox names."""
+    rename = {}
+    for bone in ao.data.bones:
+        export_name = export_channel_name(bone)
+        if export_name != bone.name:
+            rename[bone.name] = export_name
+    if not rename:
+        return
+    for payload in keyframe_payloads:
+        poses = payload.get("kf")
+        if not isinstance(poses, dict) or not any(name in rename for name in poses):
+            continue
+        remapped = {}
+        for name, pose in poses.items():
+            target = rename.get(name, name)
+            # A deform channel may already be emitted under the Roblox name;
+            # it wins, as it did when both were sent.
+            if target in remapped and target != name:
+                continue
+            remapped[target] = pose
+        payload["kf"] = remapped
+
+
+def export_pose_markers(ao) -> List[Dict[str, Any]]:
+    """The action's pose markers as Studio keyframe names / KeyframeMarkers.
+
+    Markers that came from Studio keep their exact name, value and type
+    (stored by the importer); markers added in Blender become keyframe names.
+    """
+    animation_data = getattr(ao, "animation_data", None)
+    action = getattr(animation_data, "action", None) if animation_data else None
+    if action is None or not len(getattr(action, "pose_markers", ())):
+        return []
+    scene = bpy.context.scene
+    fps = get_scene_fps()
+    try:
+        imported = {
+            (entry.get("label"), int(entry.get("frame"))): entry
+            for entry in json.loads(action.get("rbx_markers", "[]"))
+            if isinstance(entry, dict)
+        }
+    except (TypeError, ValueError):
+        imported = {}
+    markers = []
+    for marker in sorted(action.pose_markers, key=lambda item: item.frame):
+        time = (marker.frame - scene.frame_start) / fps
+        if time < 0:
+            continue
+        source = imported.get((marker.name, int(marker.frame)))
+        if source is not None:
+            markers.append({
+                "name": source.get("name") or marker.name,
+                "value": source.get("value") or "",
+                "type": source.get("type") or "Name",
+                "time": time,
+            })
+        else:
+            markers.append({"name": marker.name, "type": "Name", "time": time})
+    return markers
+
+
+_OBJECT_TRANSFORM_PATHS = frozenset({
+    "location", "rotation_euler", "rotation_quaternion", "rotation_axis_angle",
+    "scale", "delta_location", "delta_rotation_euler", "delta_rotation_quaternion",
+    "delta_scale",
+})
+
+
+def collect_export_warnings(ao, analysis=None) -> List[str]:
+    """Things in the Blender scene that Roblox will not play back."""
+    warnings: List[str] = []
+    animation_data = getattr(ao, "animation_data", None)
+    action = getattr(animation_data, "action", None) if animation_data else None
+    fcurves = []
+    if action is not None:
+        try:
+            fcurves = list(get_action_fcurves(
+                action, slot=get_animation_data_action_slot(animation_data, action=action)
+            ))
+        except Exception:
+            fcurves = []
+
+    # Bone scale: Roblox poses are rotation + position only.
+    scaled = set()
+    for fcurve in fcurves:
+        data_path = getattr(fcurve, "data_path", "")
+        if not data_path.endswith(".scale"):
+            continue
+        bone_name = POSE_BONE_PATH_PATTERN.search(data_path)
+        if bone_name is None:
+            continue
+        if any(abs(point.co.y - 1.0) > 1e-4 for point in fcurve.keyframe_points):
+            scaled.add(bone_name.group(1))
+    for pose_bone in ao.pose.bones:
+        if any(abs(value - 1.0) > 1e-4 for value in pose_bone.scale):
+            scaled.add(pose_bone.name)
+    if scaled:
+        names = sorted(scaled)
+        warnings.append(
+            "Roblox can't play bone scale, so it was ignored for: "
+            + ", ".join(names[:8])
+            + (f" (+{len(names) - 8} more)" if len(names) > 8 else "")
+            + "."
+        )
+
+    # Object-level animation never reaches Roblox.
+    object_paths = sorted({
+        fcurve.data_path for fcurve in fcurves
+        if getattr(fcurve, "data_path", "") in _OBJECT_TRANSFORM_PATHS
+    })
+    if object_paths:
+        warnings.append(
+            "The armature object itself is animated (" + ", ".join(object_paths)
+            + "), but only bone animation is exported. Animate the root bone, or use "
+            "'Apply armature object transform to the root bone'."
+        )
+
+    # Keys outside the exported scene range are dropped.
+    scene = bpy.context.scene
+    try:
+        source_range = resolve_export_frame_range(ao)
+    except Exception:
+        source_range = None
+    if source_range is not None:
+        source_start, source_end = source_range
+        if source_start < scene.frame_start or source_end > scene.frame_end:
+            warnings.append(
+                f"Keys run from frame {source_start} to {source_end}, but the scene "
+                f"range is {scene.frame_start}-{scene.frame_end}; only the scene "
+                "range is exported."
+            )
+    return warnings
 
 
 # Bone samplers moved to animation/sampling.py.
@@ -338,7 +490,7 @@ def get_all_driven_bones(armature_obj: "bpy.types.Object") -> Set[str]:
     if not anim_data or not getattr(anim_data, "drivers", None):
         return driven_bones
 
-    bone_name_pattern = re.compile(r'pose\.bones\["(.+?)"\]')
+    bone_name_pattern = POSE_BONE_PATH_PATTERN
     for fcurve in anim_data.drivers:
         data_path = getattr(fcurve, "data_path", "")
         if not data_path or not data_path.startswith("pose.bones"):
@@ -791,6 +943,10 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
             original_parent = bone.bone.get("worldspace_original_parent", "")
             if original_parent:
                 worldspace_parent_map[bone.name] = original_parent
+                # Its Roblox pose is relative to the original parent, which can
+                # move between this bone's own keys. Sample every frame so the
+                # bone holds its world placement in Studio too.
+                non_inheriting_bones.add(bone.name)
     if analysis.is_skinned_rig:
         non_inheriting_bones = get_deform_descendant_bones(
             ao,
@@ -805,7 +961,7 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
         fcurves = get_action_fcurves(action, slot=analysis.action_slot)
         for fcurve in fcurves:
             if fcurve.data_path.startswith("pose.bones"):
-                match = re.search(r'pose\.bones\["(.+?)"\]', fcurve.data_path)
+                match = POSE_BONE_PATH_PATTERN.search(fcurve.data_path)
                 if match:
                     animated_bones.add(match.group(1))
 
@@ -1250,8 +1406,35 @@ def serialize(
 ) -> Dict[str, Any]:
     """Evaluate hidden export rigs as well as visible controls."""
     from ..core.evaluation import rig_evaluation_context
+    from .sampling import export_errors, reset_export_errors
+
+    reset_export_errors()
     with rig_evaluation_context(ao):
-        return _serialize_evaluated(ao, target_bone_rest)
+        result = _serialize_evaluated(ao, target_bone_rest)
+    if isinstance(result, dict):
+        _remap_channel_names(ao, result.get("kfs") or [])
+        markers = export_pose_markers(ao)
+        if markers:
+            result["markers"] = markers
+        warnings = []
+        try:
+            warnings.extend(collect_export_warnings(ao))
+        except Exception as exc:
+            warnings.append(f"Could not check the export for problems: {exc}")
+        errors = export_errors()
+        if errors:
+            warnings.append(
+                "Some bones failed to export and are missing: " + "; ".join(errors[:5])
+            )
+        if warnings:
+            export_info = result.setdefault("export_info", {})
+            existing = export_info.setdefault("warnings", [])
+            for warning in warnings:
+                if warning not in existing:
+                    existing.append(warning)
+            for warning in warnings:
+                print(f"Blender Addon: Export warning: {warning}")
+    return result
 
 
 def _serialize_evaluated(ao, target_bone_rest=None):
@@ -1263,7 +1446,11 @@ def _serialize_evaluated(ao, target_bone_rest=None):
     original_subframe = ctx.scene.frame_subframe
     analysis = _analyze_export(ao, target_bone_rest)
     visual_bones = get_all_constrained_bones(ao) | get_all_driven_bones(ao)
-    visual_bones.update(b.name for b in ao.pose.bones if not b.bone.use_inherit_rotation)
+    visual_bones.update(
+        b.name for b in ao.pose.bones
+        if not b.bone.use_inherit_rotation
+        or (b.bone.get("worldspace_bone") and b.bone.get("worldspace_original_parent"))
+    )
     if analysis.is_skinned_rig:
         visual_bones = get_deform_descendant_bones(ao, visual_bones)
     analysis.visual_bones = visual_bones
@@ -1421,8 +1608,12 @@ def _serialize_evaluated(ao, target_bone_rest=None):
             )
             if scale_warning:
                 print(f"Blender Addon: {scale_warning}")
-    except Exception:
-        pass
+    except Exception as exc:
+        # Timing metadata is optional for playback, but say why it's missing.
+        print(f"Blender Addon: could not build export_info: {exc}")
+        result.setdefault("export_info", {}).setdefault("warnings", []).append(
+            f"Export metadata is incomplete: {exc}"
+        )
 
     # Ensure we always return a valid result, even for empty/static animations.
     if not result.get("kfs"):

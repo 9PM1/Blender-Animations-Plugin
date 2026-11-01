@@ -122,12 +122,17 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         row.label(text="Connection", icon="WORLD_DATA")
 
         row = server_box.row(align=True)
+        settings = getattr(scene, "rbx_anim_settings", None)
         if not get_server_status():
             row.operator("object.start_server", text="Start Server", icon="PLAY")
+            row.prop(settings, "rbx_server_port", text="")
         else:
+            from ..server import server as server_module  # noqa: PLC0415
+
             row.operator("object.stop_server", text="Stop Server", icon="PAUSE")
-        settings = getattr(scene, "rbx_anim_settings", None)
-        row.prop(settings, "rbx_server_port", text="")
+            # The scene's port can differ from the running server's after
+            # opening another file; show the port Studio must actually use.
+            row.label(text=f"Port {server_module.server_port}")
 
         # --- 2b. ROBLOX ACCOUNT ---
         from ..core import auth  # noqa: PLC0415

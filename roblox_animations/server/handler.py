@@ -1,391 +1,352 @@
 """
 HTTP request handler for the animation server.
+
+Runs on the server's socket threads. It never touches ``bpy``: every request
+that needs Blender data is handed to the main thread through ``dispatch``.
 """
 
-import json
-import time
-import urllib.parse
+from __future__ import annotations
+
 import http.server
+import json
 import traceback
-import bpy
-from ..core.utils import get_cached_armatures, get_cached_armature_hash, get_object_by_name
-from .requests import (
-    pending_requests,
-    pending_responses,
+import urllib.parse
+
+from . import dispatch
+from .security import (
+    RequestRejected,
+    decompress_body,
+    is_json_or_binary_content_type,
+    read_request_body,
+    validate_request_headers,
 )
+
+PROTOCOL_VERSION = 2
+
+# Status checks and armature lists are quick; when Blender can't start them
+# within a few seconds it is busy, and Studio should say so rather than wait.
+_QUICK_START_TIMEOUT = 4.0
+_QUICK_RUN_TIMEOUT = 30.0
+
+
+def _addon_version() -> str:
+    try:
+        from .. import bl_info  # noqa: PLC0415
+
+        return ".".join(str(part) for part in bl_info.get("version", ()))
+    except Exception:
+        return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Main-thread jobs. Each wraps one of the ``requests`` executors, which report
+# through ``pending_responses`` keyed by a unique task id.
+# ---------------------------------------------------------------------------
+
+
+def _take_response(task_id):
+    from .requests import pending_responses  # noqa: PLC0415
+
+    return pending_responses.pop(task_id, (False, "No response was produced."))
+
+
+def _job_list_armatures():
+    from .requests import execute_list_armatures  # noqa: PLC0415
+
+    task_id = dispatch.new_task_id("list")
+    execute_list_armatures(task_id)
+    return _take_response(task_id)
+
+
+def _job_animation_status(armature_name, last_known_hash):
+    from ..core.utils import get_cached_armature_hash, get_object_by_name  # noqa: PLC0415
+
+    obj = get_object_by_name(armature_name)
+    if not (obj and obj.type == "ARMATURE"):
+        return None
+    current_hash = get_cached_armature_hash(armature_name)
+    return {"has_update": current_hash != last_known_hash, "hash": current_hash}
+
+
+def _job_bone_rest(armature_name):
+    from .requests import execute_get_bone_rest  # noqa: PLC0415
+
+    task_id = dispatch.new_task_id("rest")
+    execute_get_bone_rest(task_id, armature_name)
+    return _take_response(task_id)
+
+
+def _job_export(armature_name, target_bone_rest, live_preview, delta_base_hash):
+    from .requests import execute_in_main_thread  # noqa: PLC0415
+
+    task_id = dispatch.new_task_id("export")
+    execute_in_main_thread(
+        task_id, armature_name, target_bone_rest, live_preview, delta_base_hash
+    )
+    return _take_response(task_id)
+
+
+def _job_import(animation_data, target_armature):
+    from .requests import execute_import_animation  # noqa: PLC0415
+
+    task_id = dispatch.new_task_id("import")
+    execute_import_animation(task_id, animation_data, target_armature)
+    return _take_response(task_id)
 
 
 class AnimationHandler(http.server.BaseHTTPRequestHandler):
-    """HTTP request handler for animation server endpoints"""
+    """HTTP request handler for the animation server endpoints."""
 
-    def get_available_armatures(self):
-        """Get list of available armatures and their properties"""
-        # Use cached armature list for better performance
-        cached_armatures = get_cached_armatures()
-        armatures = []
-        for armature_name in cached_armatures:
-            obj = get_object_by_name(armature_name)
-            if obj:  # Double-check object still exists
-                armature_info = {
-                    "name": obj.name,
-                    "bones": [bone.name for bone in obj.data.bones],
-                    "num_bones": len(obj.data.bones),
-                    "has_animation": bool(
-                        obj.animation_data and obj.animation_data.action
-                    ),
-                    "frame_range": [
-                        bpy.context.scene.frame_start,
-                        bpy.context.scene.frame_end,
-                    ]
-                    if obj.animation_data
-                    else None,
-                }
-                armatures.append(armature_info)
-        return armatures
+    server_version = "RBXMonkeySync/2"
 
-    def do_GET(self):
-        """Handle GET requests"""
-        if self.path.startswith("/animation_status"):
-            query_components = urllib.parse.parse_qs(
-                urllib.parse.urlparse(self.path).query
-            )
-            armature_name = query_components.get("armature", [None])[0]
-            # Use unquote_plus to handle both %20 and + for spaces consistently
-            if armature_name:
-                armature_name = urllib.parse.unquote_plus(armature_name)
-            last_known_hash = query_components.get("last_known_hash", [""])[0]
+    # ------------------------------------------------------------------ utils
 
-            if not armature_name:
-                self.send_detailed_error(
-                    400, "Bad Request", "Armature name not provided"
+    def log_message(self, format, *args):  # noqa: A002 - BaseHTTPRequestHandler API
+        # One line per request in Blender's console was the main source of log
+        # spam during live sync; errors are still printed by send_detailed_error.
+        return
+
+    def _send_body(self, code, body: bytes, content_type: str, extra_headers=None):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _send_json(self, code, payload, extra_headers=None):
+        self._send_body(
+            code,
+            json.dumps(payload).encode("utf-8"),
+            "application/json",
+            extra_headers,
+        )
+
+    def send_detailed_error(self, code, message, details=None, extra_headers=None):
+        """Send an error with detailed information."""
+        if code >= 500 or code == 403:
+            print(f"Blender Addon: HTTP {code} for {self.command} {self.path}: {message}")
+        self._send_json(
+            code,
+            {"error": True, "code": code, "message": str(message), "details": details},
+            extra_headers,
+        )
+
+    def _parsed(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        # parse_qs decodes exactly once ('+' -> ' ', '%2B' -> '+').
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        return parsed.path, query
+
+    @staticmethod
+    def _path_argument(path, prefix):
+        """The URL-decoded segment after ``prefix``. '+' in a path is literal."""
+        return urllib.parse.unquote(path[len(prefix):])
+
+    def _run(self, fn, *args, quick=False, **kwargs):
+        """Run a job on the main thread, translating dispatch errors to HTTP."""
+        try:
+            if quick:
+                return True, dispatch.run_on_main_thread(
+                    fn,
+                    *args,
+                    start_timeout=_QUICK_START_TIMEOUT,
+                    run_timeout=_QUICK_RUN_TIMEOUT,
+                    **kwargs,
                 )
-                return
+            return True, dispatch.run_on_main_thread(fn, *args, **kwargs)
+        except dispatch.BlenderBusy as exc:
+            self.send_detailed_error(503, str(exc), extra_headers={"Retry-After": "1"})
+        except dispatch.JobTimedOut as exc:
+            self.send_detailed_error(504, str(exc))
+        except Exception as exc:  # executor bug: report it instead of dropping the socket
+            traceback.print_exc()
+            self.send_detailed_error(500, f"Server error: {exc}")
+        return False, None
 
-            obj = get_object_by_name(armature_name)
-            if not (obj and obj.type == "ARMATURE"):
-                self.send_detailed_error(404, "Not Found", "Armature not found")
-                return
+    def _validate(self) -> bool:
+        try:
+            validate_request_headers(self.headers)
+        except RequestRejected as exc:
+            self.send_detailed_error(exc.status, exc.message)
+            return False
+        return True
 
-            # Always use cached combined hash (action + timeline) - the caching mechanism handles staleness
-            current_hash = get_cached_armature_hash(armature_name)
-
-            has_update = current_hash != last_known_hash
-
-            response_data = {
-                "has_update": has_update,
-                "hash": current_hash,
-            }
-
-            self.send_response(200)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(response_data).encode("utf-8"))
-            return
-
-        elif self.path == "/list_armatures":
-            print("Blender Addon: Received GET request for /list_armatures")
-            try:
-                task_id = str(time.time())
-                # Add a specific request for listing armatures
-                pending_requests.append(("list_armatures", task_id))
-                print(f"Blender Addon: Queued task {('list_armatures', task_id)}")
-
-                # Process immediately to avoid timer delay
-                from .requests import process_pending_requests
-
-                process_pending_requests()
-
-                start_time = time.time()
-                while task_id not in pending_responses:
-                    if time.time() - start_time > 5:  # 5 second timeout
-                        print("Blender Addon: Request for /list_armatures timed out.")
-                        self.send_detailed_error(408, "Request timeout")
-                        return
-                    time.sleep(0.01)
-
-                print(f"Blender Addon: Found response for task {task_id}")
-                success, data = pending_responses.pop(task_id)
-
-                if not success:
-                    print(f"Blender Addon: Task {task_id} failed. Sending 500 error.")
-                    self.send_detailed_error(500, data)
-                    return
-
-                # Send response from main thread
-                print(
-                    f"Blender Addon: Sending success response for /list_armatures. Data length: {len(data)}"
-                )
-                self.send_response(200)
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)  # data is already encoded
-            except Exception as e:
-                error_msg = f"Server error: {str(e)}"
-                print(error_msg)
-                traceback.print_exc()
-                self.send_detailed_error(500, error_msg)
-
-            return
-
-        elif self.path.startswith("/get_bone_rest/"):
-            armature_name_encoded = self.path.split("/")[-1]
-            # Use quote_plus to handle both %20 and + for spaces consistently
-            armature_name = urllib.parse.unquote_plus(armature_name_encoded)
-            try:
-                task_id = str(time.time())
-                pending_requests.append(("get_bone_rest", task_id, armature_name))
-
-                # Process immediately to avoid timer delay
-                from .requests import process_pending_requests
-
-                process_pending_requests()
-
-                start_time = time.time()
-                while task_id not in pending_responses:
-                    if time.time() - start_time > 5:
-                        self.send_detailed_error(408, "Request timeout")
-                        return
-                    time.sleep(0.01)
-
-                success, data = pending_responses.pop(task_id)
-
-                if not success:
-                    self.send_detailed_error(500, data)
-                    return
-
-                # Send JSON data
-                self.send_response(200)
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-            except Exception as e:
-                error_msg = f"Server error: {str(e)}"
-                print(error_msg)
-                traceback.print_exc()
-                self.send_detailed_error(500, error_msg)
-
-            return
-
-        elif self.path.startswith("/export_animation/"):
-            parsed_url = urllib.parse.urlparse(self.path)
-            armature_name_encoded = parsed_url.path.split("/")[-1]
-            # Use quote_plus to handle both %20 and + for spaces consistently
-            armature_name = urllib.parse.unquote_plus(armature_name_encoded)
-            try:
-                task_id = str(time.time())
-                live_preview = urllib.parse.parse_qs(parsed_url.query).get("live_preview", ["0"])[0] == "1"
-                pending_requests.append(("export_animation", task_id, armature_name, None, live_preview))
-
-                # Process immediately to avoid timer delay
-                from .requests import process_pending_requests
-
-                process_pending_requests()
-
-                start_time = time.time()
-                while task_id not in pending_responses:
-                    if time.time() - start_time > 5:
-                        self.send_detailed_error(408, "Request timeout")
-                        return
-                    time.sleep(0.01)
-
-                success, data = pending_responses.pop(task_id)
-
-                if not success:
-                    self.send_detailed_error(500, data)
-                    return
-
-                # Send binary data directly without base64 encoding
-                self.send_response(200)
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)  # data should already be bytes
-
-            except Exception as e:
-                error_msg = f"Server error: {str(e)}"
-                print(error_msg)
-                traceback.print_exc()
-                self.send_detailed_error(500, error_msg)
-
-        else:
-            self.send_detailed_error(404, "Not Found", "Invalid endpoint")
-
-    def do_POST(self):
-        """Handle POST requests for importing animations from Roblox"""
-        if self.path.startswith("/export_animation_delta/"):
-            parsed_url = urllib.parse.urlparse(self.path)
-            armature_name = urllib.parse.unquote_plus(parsed_url.path.split("/")[-1])
-            try:
-                content_length = int(self.headers.get("Content-Length", 0) or 0)
-                request_data = json.loads(self.rfile.read(content_length).decode("utf-8")) if content_length else {}
-                target_bone_rest = request_data.get("target_bone_rest") if isinstance(request_data, dict) else None
-                base_hash = request_data.get("base_hash", "") if isinstance(request_data, dict) else ""
-                task_id = str(time.time())
-                pending_requests.append(("export_animation", task_id, armature_name,
-                                        target_bone_rest, False, base_hash))
-                from .requests import process_pending_requests
-                process_pending_requests()
-                start_time = time.time()
-                while task_id not in pending_responses:
-                    if time.time() - start_time > 5:
-                        self.send_detailed_error(408, "Request timeout")
-                        return
-                    time.sleep(0.01)
-                success, data = pending_responses.pop(task_id)
-                if not success:
-                    self.send_detailed_error(500, data)
-                    return
-                self.send_response(200)
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-            except Exception as exc:
-                self.send_detailed_error(500, str(exc))
-                traceback.print_exc()
-
-        elif self.path.startswith("/export_animation/"):
-            parsed_url = urllib.parse.urlparse(self.path)
-            armature_name_encoded = parsed_url.path.split("/")[-1]
-            armature_name = urllib.parse.unquote_plus(armature_name_encoded)
-
-            try:
-                content_length = int(self.headers.get("Content-Length", 0) or 0)
-                target_bone_rest = None
-                live_preview = urllib.parse.parse_qs(parsed_url.query).get("live_preview", ["0"])[0] == "1"
-                if content_length > 0:
-                    post_data = self.rfile.read(content_length)
-                    request_data = json.loads(post_data.decode("utf-8"))
-                    if isinstance(request_data, dict):
-                        target_bone_rest = request_data.get("target_bone_rest")
-
-                task_id = str(time.time())
-                pending_requests.append(
-                    ("export_animation", task_id, armature_name, target_bone_rest, live_preview)
-                )
-
-                from .requests import process_pending_requests
-
-                process_pending_requests()
-
-                start_time = time.time()
-                while task_id not in pending_responses:
-                    if time.time() - start_time > 5:
-                        self.send_detailed_error(408, "Request timeout")
-                        return
-                    time.sleep(0.01)
-
-                success, data = pending_responses.pop(task_id)
-                if not success:
-                    self.send_detailed_error(500, data)
-                    return
-
-                self.send_response(200)
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-            except Exception as e:
-                error_msg = f"Server error: {str(e)}"
-                print(error_msg)
-                traceback.print_exc()
-                self.send_detailed_error(500, error_msg)
-
-        elif self.path.startswith("/import_animation"):
-            # Parse target armature from query parameters
-            query_components = urllib.parse.parse_qs(
-                urllib.parse.urlparse(self.path).query
-            )
-            target_armature = query_components.get("armature", [None])[0]
-            # Use unquote_plus to handle both %20 and + for spaces consistently
-            if target_armature:
-                target_armature = urllib.parse.unquote_plus(target_armature)
-
-            content_length = int(self.headers["Content-Length"])
-            post_data = self.rfile.read(content_length)
-
-            try:
-                import zlib
-
-                # Try to decompress, assuming zlib compressed data first
-                try:
-                    decompressed = zlib.decompress(post_data, 16 + zlib.MAX_WBITS)
-                except zlib.error:
-                    # If decompression fails, assume it's raw JSON
-                    decompressed = post_data
-
-                animation_data = json.loads(decompressed.decode("utf-8"))
-
-                # Queue import operation for main thread with target armature
-                task_id = str(time.time())
-                pending_requests.append(
-                    ("import", task_id, animation_data, target_armature)
-                )
-
-                # Process immediately to avoid timer delay
-                from .requests import process_pending_requests
-
-                process_pending_requests()
-
-                # Wait for response
-                start_time = time.time()
-                while task_id not in pending_responses:
-                    if time.time() - start_time > 5:
-                        self.send_detailed_error(408, "Request timeout")
-                        return
-                    time.sleep(0.01)
-
-                success, message = pending_responses.pop(task_id)
-
-                if success:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"success": True}).encode())
-                else:
-                    self.send_detailed_error(500, message)
-
-            except Exception as e:
-                self.send_detailed_error(500, str(e))
-                traceback.print_exc()
-        else:
-            self.send_detailed_error(404, "Not Found")
+    # --------------------------------------------------------------- methods
 
     def do_OPTIONS(self):
-        """Handle preflight requests"""
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Max-Age", "86400")
-        self.end_headers()
+        """No CORS: browsers must not be able to call this server."""
+        self.send_detailed_error(403, "Cross-origin requests are not allowed.")
 
-    def send_detailed_error(self, code, message, details=None):
-        """Send an error with detailed information"""
-        print(
-            f"Blender Addon: Sending error - Code: {code}, Message: {message}, Details: {details}"
+    def do_GET(self):
+        if not self._validate():
+            return
+        path, query = self._parsed()
+
+        if path == "/oauth2/callback":
+            # The Roblox login redirect lands here when this server owns the
+            # login's callback port (31337). No bpy access: the token exchange
+            # runs on this socket thread like the standalone callback server.
+            from ..core import auth  # noqa: PLC0415
+
+            status, text = auth.handle_shared_callback(self.path)
+            self._send_body(status, text.encode("utf-8"), "text/plain; charset=utf-8")
+            return
+
+        if path == "/ping":
+            status = dispatch.status_snapshot()
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "server": "RBXMonkey",
+                    "protocol": PROTOCOL_VERSION,
+                    "version": _addon_version(),
+                    "busy": status["busy"],
+                    "blend_file": status["blend_file"],
+                },
+            )
+            return
+
+        if path == "/animation_status":
+            armature_name = (query.get("armature") or [""])[0]
+            last_known_hash = (query.get("last_known_hash") or [""])[0]
+            if not armature_name:
+                self.send_detailed_error(400, "Armature name not provided")
+                return
+            ok, data = self._run(
+                _job_animation_status, armature_name, last_known_hash, quick=True
+            )
+            if not ok:
+                return
+            if data is None:
+                self.send_detailed_error(404, f"Armature '{armature_name}' not found")
+                return
+            self._send_json(200, data)
+            return
+
+        if path == "/list_armatures":
+            ok, result = self._run(_job_list_armatures, quick=True)
+            if not ok:
+                return
+            success, data = result
+            if not success:
+                self.send_detailed_error(500, data)
+                return
+            self._send_body(200, data, "application/json")
+            return
+
+        if path.startswith("/get_bone_rest/"):
+            armature_name = self._path_argument(path, "/get_bone_rest/")
+            ok, result = self._run(_job_bone_rest, armature_name)
+            if not ok:
+                return
+            success, data = result
+            if not success:
+                self.send_detailed_error(500, data)
+                return
+            self._send_body(200, data, "application/json")
+            return
+
+        if path.startswith("/export_animation/"):
+            armature_name = self._path_argument(path, "/export_animation/")
+            live_preview = (query.get("live_preview") or ["0"])[0] == "1"
+            self._respond_export(armature_name, None, live_preview, None)
+            return
+
+        self.send_detailed_error(404, "Not Found", "Invalid endpoint")
+
+    def do_POST(self):
+        if not self._validate():
+            return
+        if not is_json_or_binary_content_type(self.headers.get("Content-Type")):
+            self.send_detailed_error(
+                415, "POST bodies must be application/json or application/octet-stream."
+            )
+            return
+        path, query = self._parsed()
+        try:
+            body = read_request_body(self.headers, self.rfile)
+        except RequestRejected as exc:
+            self.send_detailed_error(exc.status, exc.message)
+            return
+
+        if path.startswith("/export_animation_delta/") or path.startswith("/export_animation/"):
+            is_delta = path.startswith("/export_animation_delta/")
+            prefix = "/export_animation_delta/" if is_delta else "/export_animation/"
+            armature_name = self._path_argument(path, prefix)
+            request_data = self._json_body(body)
+            if request_data is _INVALID:
+                return
+            target_bone_rest = request_data.get("target_bone_rest")
+            base_hash = request_data.get("base_hash", "") if is_delta else None
+            live_preview = (query.get("live_preview") or ["0"])[0] == "1"
+            self._respond_export(
+                armature_name,
+                target_bone_rest,
+                False if is_delta else live_preview,
+                (base_hash or "") if is_delta else None,
+            )
+            return
+
+        if path == "/import_animation":
+            target_armature = (query.get("armature") or [None])[0] or None
+            try:
+                payload = decompress_body(body)
+            except RequestRejected as exc:
+                self.send_detailed_error(exc.status, exc.message)
+                return
+            try:
+                animation_data = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                self.send_detailed_error(400, f"Animation data is not valid JSON: {exc}")
+                return
+            if not isinstance(animation_data, dict) or not isinstance(
+                animation_data.get("kfs"), list
+            ):
+                self.send_detailed_error(400, "Animation data must be an object with a 'kfs' list.")
+                return
+            ok, result = self._run(_job_import, animation_data, target_armature)
+            if not ok:
+                return
+            success, message = result
+            if not success:
+                self.send_detailed_error(500, message)
+                return
+            self._send_json(200, {"success": True, "message": message})
+            return
+
+        self.send_detailed_error(404, "Not Found")
+
+    # -------------------------------------------------------------- helpers
+
+    def _json_body(self, body):
+        if not body:
+            return {}
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self.send_detailed_error(400, f"Request body is not valid JSON: {exc}")
+            return _INVALID
+        return data if isinstance(data, dict) else {}
+
+    def _respond_export(self, armature_name, target_bone_rest, live_preview, delta_base_hash):
+        if not armature_name:
+            self.send_detailed_error(400, "Armature name not provided")
+            return
+        ok, result = self._run(
+            _job_export, armature_name, target_bone_rest, live_preview, delta_base_hash
         )
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
+        if not ok:
+            return
+        success, data = result
+        if not success:
+            self.send_detailed_error(500, data)
+            return
+        self._send_body(200, data, "application/octet-stream")
 
-        error_data = {
-            "error": True,
-            "code": code,
-            "message": message,
-            "details": details,
-        }
 
-        self.wfile.write(json.dumps(error_data).encode("utf-8"))
+_INVALID = object()

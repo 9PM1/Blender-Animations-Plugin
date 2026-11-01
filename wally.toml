@@ -1,0 +1,12 @@
+[package]
+name = "cautioned/rbxmonkey-studio-plugin"
+version = "3.1.2"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+private = true
+
+# The Studio plugin is written against Fusion 0.2 (Value:get(), Observer,
+# Hydrate). `wally install` puts it in ./Packages, which the Rojo projects map
+# into BlenderAnimationsInternal.Packages.
+[dependencies]
+Fusion = "elttob/fusion@0.2.0"

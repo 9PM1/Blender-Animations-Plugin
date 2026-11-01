@@ -12,6 +12,28 @@ local BlenderSyncManager = {}
 BlenderSyncManager.__index = BlenderSyncManager
 
 local REST_DISTANCE_EPSILON = 1e-5
+-- A WebSocket sync request with no answer by then is retried (it used to
+-- leave live sync waiting forever).
+local SYNC_REQUEST_TIMEOUT = 15
+BlenderSyncManager.syncRequestTimeout = SYNC_REQUEST_TIMEOUT
+
+local function showProblem(message: string?)
+	if not message or message == "" then
+		return
+	end
+	warn("[Blender Sync] " .. message)
+	local rigManager = (State :: any).rigManager
+	if rigManager and rigManager.addWarning then
+		rigManager:addWarning(message)
+	end
+end
+
+local function clearProblem(message: string?)
+	local rigManager = (State :: any).rigManager
+	if message and rigManager and rigManager.removeWarning then
+		rigManager:removeWarning(message)
+	end
+end
 
 local function buildTargetBoneRestCalibration(activeRig: any): any?
 	if not activeRig or not activeRig.bones then
@@ -76,23 +98,46 @@ function BlenderSyncManager.new(playbackService: any, animationManager: any)
 end
 
 function BlenderSyncManager:updateAvailableArmatures()
-	local status, result = pcall(function()
+	local status, result, failureKind, failureMessage = pcall(function()
 		return self.blenderConnectionService:ListArmatures(State.serverPort:get())
 	end)
+
+	if status and not result and failureKind == "throttled" then
+		-- A refresh is already in flight; that's not a disconnect.
+		return State.isServerConnected:get()
+	end
+	if status and not result and failureKind == "busy" then
+		State.serverStatus:set("Connected (Blender is busy)")
+		return true
+	end
 
 	if not status or not result then
 		State.availableArmatures:set({})
 		State.serverStatus:set("Disconnected")
-		if not status then
-			warn("Error listing armatures:", result)
+		local message = if status then failureMessage else ("Error listing armatures: " .. tostring(result))
+		if self.lastConnectionProblem ~= message then
+			clearProblem(self.lastConnectionProblem)
+			self.lastConnectionProblem = message
+			showProblem(message)
 		end
 		return false
 	end
 
+	clearProblem(self.lastConnectionProblem)
+	self.lastConnectionProblem = nil
+
 	local armatures = result
 	State.availableArmatures:set(armatures)
-	State.serverStatus:set("Connected")
-	print("Auto-refreshed armatures:", #armatures, "found")
+	-- Name the Blender file, so two open Blenders can't be confused.
+	local pingOk, info = pcall(function()
+		return self.blenderConnectionService:Ping(State.serverPort:get())
+	end)
+	local blendFile = if pingOk and type(info) == "table" then info.blend_file else nil
+	if type(blendFile) == "string" and blendFile ~= "" then
+		State.serverStatus:set("Connected to " .. blendFile)
+	else
+		State.serverStatus:set("Connected")
+	end
 	
 	-- Auto-select if there's only one armature and none is currently selected
 	if #armatures == 1 and not State.selectedArmature:get() then
@@ -122,7 +167,22 @@ function BlenderSyncManager:importAnimationFromBlender(livePreview: boolean?)
 	end
 
 	local targetBoneRest = self:_getRestCalibration()
-	local responseBody = self.blenderConnectionService:ImportAnimation(State.serverPort:get(), (armature :: any).name, targetBoneRest, livePreview)
+	local responseBody, failureKind, failureMessage = self.blenderConnectionService:ImportAnimation(
+		State.serverPort:get(),
+		(armature :: any).name,
+		targetBoneRest,
+		livePreview
+	)
+
+	if not responseBody and failureKind == "busy" then
+		State.serverStatus:set("Connected (Blender is busy)")
+		return false
+	end
+	if not responseBody then
+		-- Say why (Edit Mode, missing armature...), not just "failed".
+		showProblem(failureMessage)
+		return false
+	end
 
 	if responseBody then
 		-- The response is binary, so we pass `true`
@@ -186,7 +246,11 @@ function BlenderSyncManager:exportAnimationToBlender()
 		targetArmature = (State.selectedArmature:get() :: any).name
 	end
 	
-	return self.blenderConnectionService:ExportAnimation(State.serverPort:get(), animData, targetArmature)
+	local ok, message = self.blenderConnectionService:ExportAnimation(State.serverPort:get(), animData, targetArmature)
+	if not ok then
+		showProblem(message)
+	end
+	return ok
 end
 
 function BlenderSyncManager:stopLiveSyncing()
@@ -224,6 +288,28 @@ function BlenderSyncManager:_drainLiveSyncUpdates(client: any)
 	self.webSocketRequestId = requestId
 	self.webSocketRequestBaseHash = self.liveSyncRevision
 	self.isLiveImportInFlight = true
+	-- Watchdog: an unanswered request must not stall live sync forever.
+	task.delay(BlenderSyncManager.syncRequestTimeout, function()
+		if self.webStreamClient == client and self.webSocketRequestId == requestId then
+			self.isLiveImportInFlight = false
+			self.webSocketRequestId = nil
+			self.webSocketTimeouts = (self.webSocketTimeouts or 0) + 1
+			if self.webSocketTimeouts >= 3 then
+				-- The socket is open but Blender isn't answering: use HTTP
+				-- polling, which notices a closed Blender.
+				warn("[Blender Sync] Blender stopped answering live-sync requests; switching to polling.")
+				self.webSocketTimeouts = 0
+				self:_closeWebSocket()
+				if State.liveSyncEnabled:get() and State.isServerConnected:get() then
+					self:_startPolling()
+				end
+				return
+			end
+			warn("[Blender Sync] Blender didn't answer a live-sync request; retrying.")
+			self.pendingLiveSyncHash = self.pendingLiveSyncHash or triggerHash
+			self:_drainLiveSyncUpdates(client)
+		end
+	end)
 	local sent = pcall(function()
 		client:Send(self.httpService:JSONEncode({
 			type = "sync_request",
@@ -268,6 +354,7 @@ function BlenderSyncManager:_handleWebSocketPayload(client: any, update: any)
 		applied = ok and result == true
 	end
 	if applied then
+		self.webSocketTimeouts = 0
 		self.liveSyncRevision = envelope.hash
 		if type(triggerHash) == "string" then
 			State.lastKnownBlenderAnimHash:set(triggerHash)
@@ -430,7 +517,7 @@ function BlenderSyncManager:_startPolling()
 
 			if isConnected then
 				-- Periodic armature refresh
-				local currentTime = tick()
+				local currentTime = os.clock()
 				if currentTime - lastArmatureRefresh > armatureRefreshInterval then
 					local refreshSuccess = pcall(function()
 						self:updateAvailableArmatures()
@@ -448,13 +535,29 @@ function BlenderSyncManager:_startPolling()
 					local lastHash = State.lastKnownBlenderAnimHash:get()
 					local serverPort = State.serverPort:get()
 
-					local status, err = pcall(
+					local status, err, failureKind, failureMessage = pcall(
 						self.blenderConnectionService.CheckAnimationStatus,
 						self.blenderConnectionService,
 						serverPort,
 						armatureName,
 						lastHash
 					)
+					if status and not err and failureKind == "throttled" then
+						task.wait(pollInterval)
+						continue
+					end
+					if status and not err and failureKind == "busy" then
+						-- Blender is in a dialog or modal tool: wait, don't disconnect.
+						State.serverStatus:set("Live Sync: Blender is busy")
+						task.wait(math.max(pollInterval, 0.5))
+						continue
+					end
+					-- A failed request returns nil instead of erroring; it used to count
+					-- as "no change", so a closed Blender was never noticed.
+					if status and not err then
+						status = false
+						err = failureMessage
+					end
 
 					if not status then
 						failureCount += 1
@@ -466,13 +569,15 @@ function BlenderSyncManager:_startPolling()
 						pollInterval = math.min(math.max(pollInterval * 2, 0.5), maxPollInterval)
 						noChangeCount = 0
 						if failureCount >= maxFailuresBeforeStop then
+							showProblem(if type(err) == "string" then err else "Lost the connection to Blender.")
 							self:cleanupServerConnection()
 							break
 						end
 					else
 						failureCount = 0
 						consecutiveCrashCount = 0
-						if State.serverStatus:get() == "Live Sync: Connection lost" then
+						local currentStatus = State.serverStatus:get()
+						if currentStatus == "Live Sync: Connection lost" or currentStatus == "Live Sync: Blender is busy" then
 							State.serverStatus:set("Connected") -- Restore status
 						end
 						

@@ -2579,19 +2579,21 @@ def _apply_clothing_bake(material, principled, part_name, entry):
     # is a full-colour face texture; the standard TextureID path renders it.
     # The clothing bake would overwrite it with a body-colour tint composite.
     # R15 dynamic heads (MeshParts) keep the face-over-skin bake.
+    face_texture = entry.get("face_texture", clothing._CLOTHING_CONTEXT.get("face_texture"))
     if (
         clothing._is_head(part_name)
-        and not clothing._CLOTHING_CONTEXT.get("face_texture")
+        and not face_texture
         and entry.get("class_name") == "Part"
     ):
         return
 
     color = entry.get("color") or (1.0, 1.0, 1.0)
-    image = clothing.get_limb_texture(
-        part_name,
-        (color[0], color[1], color[2], 1.0),
-        tint_ref=entry.get("texture_id"),
-    )
+    with clothing.entry_clothing_context(entry):
+        image = clothing.get_limb_texture(
+            part_name,
+            (color[0], color[1], color[2], 1.0),
+            tint_ref=entry.get("texture_id"),
+        )
     if image is None:
         return
     tex_node = _image_texture_node(material, image, "ClothingBake")

@@ -278,6 +278,11 @@ function RigPart.new(
 			if selfPriority == existingPriority and selfPriority >= 2 and existing.parent == self.parent then
 				rig._ambiguousAnimationChannels = rig._ambiguousAnimationChannels or {}
 				rig._ambiguousAnimationChannels[part.Name] = true
+			elseif selfPriority >= 2 and existing.parent ~= self.parent then
+				-- The first one wins silently in playback; tell the user so
+				-- the second (e.g. a tool's "Handle") can be renamed.
+				rig._shadowedChannels = rig._shadowedChannels or {}
+				rig._shadowedChannels[part.Name] = true
 			end
 		end
 	end

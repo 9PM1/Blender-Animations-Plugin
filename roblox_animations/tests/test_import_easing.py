@@ -76,6 +76,16 @@ class TestImportEasing(unittest.TestCase):
         swizzle = Matrix.Diagonal((-1, 1, -1, 1))
         start, end = .25, 30.75
         target = Matrix.LocRotScale(Vector((10, -2, 3)), Quaternion(axis, 2.6), Vector((1, 1, 1)))
+        # Animation time 0 lands on the scene's start frame; keep it at 0 so the
+        # frame arithmetic below stays readable. The import must never shrink
+        # the user's frame range.
+        scene = bpy.context.scene
+        previous_range = (scene.frame_start, scene.frame_end)
+        previous_rate = (scene.render.fps, scene.render.fps_base)
+        scene.frame_start, scene.frame_end = 0, 20
+        # A 30 fps scene, like the payload. Import converts by seconds and must
+        # not change the scene's frame rate.
+        scene.render.fps, scene.render.fps_base = 30, 1.0
         try:
             for style in ("Linear", "Cubic", "CubicV2", "Bounce", "Elastic", "Constant"):
                 for direction in ("In", "Out", "InOut"):
@@ -91,7 +101,10 @@ class TestImportEasing(unittest.TestCase):
                         requests.execute_import_animation("easing-import-test", data, rig.name)
                         success, message = requests.pending_responses.pop("easing-import-test")
                         self.assertTrue(success, message)
-                        self.assertEqual(bpy.context.scene.frame_end, 31)
+                        self.assertEqual(scene.frame_start, 0)
+                        self.assertEqual((scene.render.fps, scene.render.fps_base), (30, 1.0))
+                        # Extended to fit the 30.75-frame animation, never shrunk.
+                        self.assertEqual(scene.frame_end, 31)
                         frames = [start, end] + list(range(1, 31))
                         if style == "Constant":
                             edge = start if direction == "In" else (start + end) / 2 if direction == "InOut" else end
@@ -110,10 +123,20 @@ class TestImportEasing(unittest.TestCase):
                         for curve in get_action_fcurves(rig.animation_data.action):
                             self.assertTrue(all(k.interpolation in {"LINEAR", "CONSTANT"} for k in curve.keyframe_points))
         finally:
+            scene.frame_start, scene.frame_end = previous_range
+            scene.render.fps, scene.render.fps_base = previous_rate
             bpy.ops.object.mode_set(mode="OBJECT")
             bpy.data.objects.remove(rig, do_unlink=True)
 
     def test_motor6d_parent_and_staggered_child_tracks(self):
+        scene = bpy.context.scene
+        previous_start = scene.frame_start
+        previous_rate = (scene.render.fps, scene.render.fps_base)
+        scene.frame_start = 0
+        scene.render.fps, scene.render.fps_base = 30, 1.0
+        self.addCleanup(setattr, scene, "frame_start", previous_start)
+        self.addCleanup(setattr, scene.render, "fps", previous_rate[0])
+        self.addCleanup(setattr, scene.render, "fps_base", previous_rate[1])
         for name, fixture in templates().items():
             with self.subTest(rig=name):
                 if bpy.context.object and bpy.context.object.mode != "OBJECT":

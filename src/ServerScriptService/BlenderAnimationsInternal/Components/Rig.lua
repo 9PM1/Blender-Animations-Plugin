@@ -164,6 +164,8 @@ function Rig.new(model: Model)
 		boneHierarchy = {}, -- Store bone parent relationships
 		_jointCache = {},
 		_ambiguousAnimationChannels = {},
+		_shadowedChannels = {},
+		lastLoadReport = { unmatched = {}, ambiguous = {} },
 	}
 	setmetatable(self, Rig)
 
@@ -196,12 +198,14 @@ function Rig.new(model: Model)
 	end
 
 	if #duplicateBoneNames > 0 then
+		-- Channels are keyed by name, so these bones can't be told apart. That
+		-- only matters if an animation actually uses them (two accessories
+		-- with a "Root" bone used to block the whole rig): flag them, warn at
+		-- selection, and skip them when an animation names them.
 		table.sort(duplicateBoneNames)
-		error(
-			"DUPLICATE BONE NAMES DETECTED: "
-				.. table.concat(duplicateBoneNames, ", ")
-				.. ". Animation channels are keyed by name, so rename duplicates and retry."
-		)
+		for _, boneName in ipairs(duplicateBoneNames) do
+			self._ambiguousAnimationChannels[boneName] = true
+		end
 	end
 
 	-- Pre-build the joint cache for fast lookups based on actual connected parts.
@@ -685,6 +689,48 @@ local function getOrCreateHeadPose(keyframe: Keyframe): Pose
 	return headPose
 end
 
+-- Build a rotation-only CFrame from 12 components. Columns are normalised
+-- (degenerate ones fall back to the canonical axis) and then orthonormalised:
+-- normalising alone let skew from rounding or scaled bones through.
+local function orthonormalCFrame(components: { number }): CFrame
+	local values = table.create(12)
+	for index = 1, 12 do
+		values[index] = tonumber(components[index]) or 0
+	end
+	for axis = 0, 2 do
+		local x = values[4 + axis]
+		local y = values[7 + axis]
+		local z = values[10 + axis]
+		local lengthSq = x * x + y * y + z * z
+		if lengthSq > 1e-8 then
+			local invLength = 1 / math.sqrt(lengthSq)
+			values[4 + axis] = x * invLength
+			values[7 + axis] = y * invLength
+			values[10 + axis] = z * invLength
+		elseif axis == 0 then
+			values[4], values[7], values[10] = 1, 0, 0
+		elseif axis == 1 then
+			values[5], values[8], values[11] = 0, 1, 0
+		else
+			values[6], values[9], values[12] = 0, 0, 1
+		end
+	end
+	local cf = CFrame.new(table.unpack(values, 1, 12))
+	local ok, orthonormal = pcall(function()
+		return cf:Orthonormalize()
+	end)
+	return if ok then orthonormal else cf
+end
+
+Rig.orthonormalCFrame = orthonormalCFrame
+
+local function noteChannel(list: { string }, seen: { [string]: boolean }, name: string)
+	if not seen[name] then
+		seen[name] = true
+		table.insert(list, name)
+	end
+end
+
 function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 	-- Validate animation data structure
 	if not data then
@@ -706,6 +752,11 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 	self:ClearPoses()
 	
 	local appliedPoseCount = 0
+	-- Channels the rig couldn't use, reported to the user after loading
+	-- instead of being dropped silently.
+	local report = { unmatched = {}, ambiguous = {} }
+	local reported: { [string]: boolean } = {}
+	self.lastLoadReport = report
 
 	local exportInfo = data.export_info
 	local timeScale = 1
@@ -812,11 +863,13 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 			local poseMarksDeform = kfdef.kf[partName .. "_deform"] ~= nil
 			local rigPart = self:FindRigPart(partName)
 			if self._ambiguousAnimationChannels and self._ambiguousAnimationChannels[partName] then
-				error(
-					"AMBIGUOUS ANIMATION CHANNELS DETECTED: "
-						.. partName
-						.. ". Duplicate animated rig part names or conflicting Motor6D aliases are unsupported because animation channels are keyed by name."
-				)
+				-- Several parts share this name; applying it to one of them
+				-- would be a guess. Skip just this channel and report it.
+				noteChannel(report.ambiguous, reported, partName)
+				continue
+			end
+			if not rigPart then
+				noteChannel(report.unmatched, reported, partName)
 			end
 			if rigPart and poseData then
 				local cfc
@@ -868,30 +921,7 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 					rigPart.isDeformBone = true
 				end
 
-				-- normalize each rotation vector, falling back to canonical axes if the vector is degenerate
-				for axis = 0, 2 do
-					local x = cfc[4 + axis]
-					local y = cfc[7 + axis]
-					local z = cfc[10 + axis]
-					local lengthSq = x * x + y * y + z * z
-					if lengthSq > 1e-8 then
-						local invLen = 1 / math.sqrt(lengthSq)
-						x *= invLen
-						y *= invLen
-						z *= invLen
-					else
-						if axis == 0 then
-							x, y, z = 1, 0, 0
-						elseif axis == 1 then
-							x, y, z = 0, 1, 0
-						else
-							x, y, z = 0, 0, 1
-						end
-					end
-					cfc[4 + axis], cfc[7 + axis], cfc[10 + axis] = x, y, z
-				end
-
-				rigPart:AddPose(kfTime, CFrame.new(unpack(cfc)), isDeformBone, easingStyle, easingDirection)
+				rigPart:AddPose(kfTime, orthonormalCFrame(cfc), isDeformBone, easingStyle, easingDirection)
 				appliedPoseCount += 1
 				if appliedPoseCount % LOAD_POSE_YIELD_INTERVAL == 0 then
 					if progressCallback then
@@ -971,6 +1001,9 @@ function Rig:ApplyAnimationDelta(delta: any, data: any): boolean
 			if type(partName) ~= "string" or string.sub(partName, -7) == "_deform" then
 				continue
 			end
+			if self._ambiguousAnimationChannels and self._ambiguousAnimationChannels[partName] then
+				continue
+			end
 			local rigPart = self:FindRigPart(partName)
 			if not rigPart or type(poseData) ~= "table" then
 				continue
@@ -997,27 +1030,9 @@ function Rig:ApplyAnimationDelta(delta: any, data: any): boolean
 					return false
 				end
 			end
-			for axis = 0, 2 do
-				local x = numeric[4 + axis]
-				local y = numeric[7 + axis]
-				local z = numeric[10 + axis]
-				local lengthSq = x * x + y * y + z * z
-				if lengthSq > 1e-8 then
-					local invLength = 1 / math.sqrt(lengthSq)
-					numeric[4 + axis] = x * invLength
-					numeric[7 + axis] = y * invLength
-					numeric[10 + axis] = z * invLength
-				elseif axis == 0 then
-					numeric[4], numeric[7], numeric[10] = 1, 0, 0
-				elseif axis == 1 then
-					numeric[5], numeric[8], numeric[11] = 0, 1, 0
-				else
-					numeric[6], numeric[9], numeric[12] = 0, 0, 1
-				end
-			end
 			local isDeform = keyframe.kf[partName .. "_deform"] ~= nil
 				or (dataIsDeformRig and rigPart.part:IsA("Bone"))
-			rigPart:AddPose(time, CFrame.new(unpack(numeric)), isDeform, easingStyle, easingDirection)
+			rigPart:AddPose(time, orthonormalCFrame(numeric), isDeform, easingStyle, easingDirection)
 		end
 		if type(keyframe.fc) == "table" then
 			for controlName, faceData in pairs(keyframe.fc) do
@@ -1052,10 +1067,11 @@ function Rig:ToRobloxAnimation(progressCallback: LoadProgressCallback?)
 		table.insert(allRigParts, 1, self.root) -- Add root to the beginning of the list to check.
 	end
 
-	local keyframeNames = self.keyframeNames or {}
+	-- Sort a copy: the caller's list (shared with the UI) keeps its order.
+	local keyframeNames = table.clone(self.keyframeNames or {})
 	table.sort(keyframeNames, function(a, b)
 		return a.time < b.time
-	end) -- Ensure names are sorted by time
+	end)
 
 	-- Collect all unique time points from poses and named events
 	local timePoints = { [0] = true } -- Always have a keyframe at t=0

@@ -53,11 +53,16 @@ function BlenderSyncTab.create(services: any)
 					end),
 					LayoutOrder = 2,
 					[OnChange("Text")] = function(newPort)
+						-- Validated as you type, but only one message, removed once the port
+						-- is valid (each keystroke of "40000" used to add another warning).
+						-- Live sync also uses the next port up, so 65534 is the highest.
+						local message = "Invalid port number. Enter a number between 1024 and 65534 (the same port as in Blender)."
 						local port = tonumber(newPort)
-						if port and port >= 1024 and port <= 65535 then
+						if port and port >= 1024 and port <= 65534 and port % 1 == 0 then
+							services.rigManager:removeWarning(message)
 							State.serverPort:set(port)
-						else
-							services.rigManager:addWarning("Invalid port number. Please enter a number between 1024 and 65535.")
+						elseif newPort ~= "" and #newPort >= 4 then
+							services.rigManager:addWarning(message)
 						end
 					end,
 				}),
@@ -324,7 +329,11 @@ function BlenderSyncTab.create(services: any)
 					end,
 				}) :: any,
 				Button({
-					Text = "Save Animation to Rig",
+					Text = Computed(function()
+						-- Say when Mirror/Speed/Resample/Simplify/Scale will change what's saved.
+						local count = #services.animationManager.activeModifierNames()
+						return if count > 0 then string.format("Save Animation to Rig (%d modifier%s on)", count, if count == 1 then "" else "s") else "Save Animation to Rig"
+					end),
 					Size = UDim2.new(1, 0, 0, 30),
 					LayoutOrder = 11,
 					Enabled = Computed(function()
@@ -342,7 +351,11 @@ function BlenderSyncTab.create(services: any)
 					end,
 				}) :: any,
 				Button({
-					Text = "Upload Animation to Roblox",
+					Text = Computed(function()
+						-- Say when Mirror/Speed/Resample/Simplify/Scale will change what's saved.
+						local count = #services.animationManager.activeModifierNames()
+						return if count > 0 then string.format("Upload Animation to Roblox (%d modifier%s on)", count, if count == 1 then "" else "s") else "Upload Animation to Roblox"
+					end),
 					Size = UDim2.new(1, 0, 0, 30),
 					LayoutOrder = 12,
 					Enabled = Computed(function()

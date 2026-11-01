@@ -5,7 +5,19 @@
     "ServerScriptService": {
       "$className": "ServerScriptService",
       "$ignoreUnknownInstances": true,
-      "$path": "src/ServerScriptService"
+      "BlenderAnimationsInternal": {
+        "$path": "src/ServerScriptService/BlenderAnimationsInternal",
+        "Packages": {
+          "$path": "Packages"
+        }
+      }
     }
-  }
+  },
+  "globIgnorePaths": [
+    "src/ServerScriptService/BlenderAnimationsInternal/tests",
+    "src/ServerScriptService/BlenderAnimationsInternal/tests/**",
+    "src/ServerScriptService/BlenderAnimationsInternal/Components/roblox_testez@0.4.1",
+    "src/ServerScriptService/BlenderAnimationsInternal/Components/roblox_testez@0.4.1/**",
+    "src/ServerScriptService/BlenderAnimationsInternal/Components/testez.lua"
+  ]
 }

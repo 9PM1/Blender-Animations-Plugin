@@ -2126,6 +2126,52 @@ def _collect_deform_bone_names(rig_def):
     return names
 
 
+def _leaf_bone_tail(o_trans, part_matrix, part_size):
+    """Tail for a bone that has no single child to point at.
+
+    The head stays on the Roblox joint pivot, which on R6 sits at a corner or
+    edge of the part. Pointing the bone "through the part centre" made R6 arms
+    and legs diagonal. Instead run straight along the part axis that crosses
+    the most of the part from the pivot (the limb's length for arms and legs,
+    "up" for heads and torsos), ending at the far face.
+    """
+    if not part_size or len(part_size) != 3:
+        return None
+    try:
+        sizes = [abs(float(value)) for value in part_size]
+    except (TypeError, ValueError):
+        return None
+    if max(sizes) < 1e-4:
+        return None
+    head = o_trans.to_translation()
+    try:
+        local_pivot = part_matrix.inverted() @ head
+    except ValueError:
+        return None
+    rotation = part_matrix.to_3x3()
+    best = None
+    for axis in range(3):
+        half = sizes[axis] / 2.0
+        offset = local_pivot[axis]
+        travel = half + abs(offset)
+        axis_vector = Vector((0.0, 0.0, 0.0))
+        axis_vector[axis] = 1.0
+        world_axis = (rotation @ axis_vector).normalized()
+        if abs(offset) > 1e-3:
+            sign = -1.0 if offset > 0 else 1.0
+        else:
+            # Pivot at the centre: point the bone up (Blender +Z) if it can.
+            sign = 1.0 if world_axis.z >= 0 else -1.0
+        upness = (world_axis * sign).z
+        key = (round(travel, 4), round(abs(offset), 4), upness)
+        if best is None or key > best[0]:
+            best = (key, world_axis * sign, travel)
+    _key, direction, travel = best
+    if travel < 0.05:
+        return None
+    return head + direction * travel
+
+
 def create_joint_bone(
     ao,
     parent_bone_name,
@@ -2159,6 +2205,7 @@ def create_joint_bone(
     if ao.mode != "EDIT":
         if not _safe_mode_set("EDIT", ao):
             return None
+    final_name = None
     try:
         edit_bones = amt.edit_bones
         parent_edit = edit_bones.get(parent_bone_name)
@@ -2184,9 +2231,16 @@ def create_joint_bone(
         bone["rbx_original_parent"] = parent_bone_name
         bone["rbx_source_name"] = bone_name
         bone["is_transformable"] = True
-        return bone.name
+        created_name = bone.name
+        return created_name
     finally:
         _safe_mode_set("OBJECT", ao)
+        try:
+            created = ao.pose.bones.get(final_name) if final_name else None
+            if created is not None:
+                created.lock_scale = (True, True, True)
+        except Exception:
+            pass
         if prev_active:
             bpy.context.view_layer.objects.active = prev_active
         if prev_mode and prev_active == ao and prev_mode != "EDIT":
@@ -2303,7 +2357,11 @@ def load_rigbone(
                     bone.tail = bone.head + direction * local_target[axis]
 
             else:
-                bone.tail = bone.head + (bone.head - neutral_pos) * -2
+                leaf_tail = _leaf_bone_tail(o_trans, t2b @ mat, rigsubdef.get("partSize"))
+                if leaf_tail is not None:
+                    bone.tail = leaf_tail
+                else:
+                    bone.tail = bone.head + (bone.head - neutral_pos) * -2
 
             if (bone.tail - bone.head).length < 0.01:
                 # just reset, no "nice" config can be found
@@ -2798,6 +2856,12 @@ def create_rig(rigging_type, rig_meta_obj_name, target_armature=None):
 
     # Configure weld bones with custom display and lock them from animation
     _configure_weld_bones(ao)
+
+    # Roblox joints and Bones can't play scale; locking it keeps the viewport
+    # honest (a scaled bone also scaled its Child Of parts, then exported
+    # without scale).
+    for pose_bone in ao.pose.bones:
+        pose_bone.lock_scale = (True, True, True)
 
     applied_skinning = _apply_skinned_mesh_bindings(ao, skinned_mesh_bindings)
     if applied_skinning:

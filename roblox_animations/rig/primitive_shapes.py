@@ -18,6 +18,25 @@ from .mesh_surface import (
 )
 
 
+def _rotate_mesh_data_x_to_y(data):
+    """Rotate generated geometry 90 degrees about Z (X axis -> Y axis)."""
+    if not data:
+        return data
+
+    def turn(vector):
+        if vector is None or len(vector) != 3:
+            return vector
+        x, y, z = vector
+        return (-y, x, z)
+
+    rotated = dict(data)
+    for key in ("positions", "normals"):
+        values = data.get(key)
+        if values:
+            rotated[key] = [turn(value) for value in values]
+    return rotated
+
+
 def _build_primitive_mesh_data(entry, include_surface_data=True):
     """Generate synthetic mesh_data from a Roblox primitive Part shape.
 
@@ -30,7 +49,15 @@ def _build_primitive_mesh_data(entry, include_surface_data=True):
         from mathutils import Vector
 
     shape = entry.get("shape", "block")
-    size = entry.get("part_size") or [4.0, 1.0, 2.0]
+    # SpecialMesh primitives render at Size * Scale (primitive_size).
+    size = entry.get("primitive_size") or entry.get("part_size") or [4.0, 1.0, 2.0]
+    if entry.get("primitive_axis") == "y" and shape in ("cylinder", 2):
+        # Build an X-axis cylinder of the Y extent, then turn it upright.
+        rotated = dict(entry)
+        rotated.pop("primitive_axis", None)
+        rotated["primitive_size"] = [size[1], size[0], size[2]]
+        data = _build_primitive_mesh_data(rotated, include_surface_data)
+        return _rotate_mesh_data_x_to_y(data)
     hx, hy, hz = float(size[0]) / 2.0, float(size[1]) / 2.0, float(size[2]) / 2.0
 
     positions = []

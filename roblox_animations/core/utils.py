@@ -282,26 +282,11 @@ def get_action_channelbag(action, slot=None):
     return None
 
 
-def get_action_hash(action):
-    """Get hash of an action's keyframe data."""
-    if not action:
-        return ""
-
-    # Get fcurves using compatibility function
-    fcurves = get_action_fcurves(action)
-    if not fcurves:
-        return ""
-
-    # Sort fcurves to ensure consistent hash
-    fcurves = sorted(fcurves, key=lambda fc: (fc.data_path, fc.array_index))
-
-    hash_parts = []
-    for fcurve in fcurves:
-        # Include data path and index to distinguish curves
-        hash_parts.append(f"{fcurve.data_path}:{fcurve.array_index}")
+def _keyframe_hash_parts(fcurves, hash_parts):
+    for fcurve in sorted(fcurves, key=lambda fc: (fc.data_path, fc.array_index)):
+        hash_parts.append(f"{fcurve.data_path}:{fcurve.array_index}:{fcurve.mute}")
         for kp in fcurve.keyframe_points:
-            # Include all relevant keyframe point properties
-            kp_data = (
+            hash_parts.append(repr((
                 kp.co.x,
                 kp.co.y,
                 kp.handle_left.x,
@@ -310,58 +295,136 @@ def get_action_hash(action):
                 kp.handle_right.y,
                 kp.interpolation,
                 kp.easing,
-            )
-            hash_parts.append(repr(kp_data))
+            )))
+        for modifier in getattr(fcurve, "modifiers", ()):
+            hash_parts.append(f"mod:{modifier.type}:{modifier.mute}")
 
+
+def get_action_hash(action, slot=None):
+    """Get hash of an action's keyframe data (for the given slot when known)."""
+    if not action:
+        return ""
+
+    try:
+        fcurves = get_action_fcurves(action, slot=slot)
+    except Exception:
+        return ""
+    if not fcurves:
+        return ""
+
+    hash_parts = []
+    _keyframe_hash_parts(fcurves, hash_parts)
     data_string = "".join(hash_parts)
     return hashlib.md5(data_string.encode("utf-8")).hexdigest()
 
 
 def get_timeline_hash():
-    """Get hash of timeline settings (frame start, end, fps, etc.)"""
+    """Get hash of timeline settings (frame range, step and exact frame rate)."""
     scene = bpy.context.scene
     timeline_data = (
         scene.frame_start,
         scene.frame_end,
+        getattr(scene, "frame_step", 1),
         scene.render.fps,
+        scene.render.fps_base,
     )
     return hashlib.md5(str(timeline_data).encode("utf-8")).hexdigest()
 
 
+def _animation_data_hash_parts(owner, hash_parts, seen_actions):
+    """Everything in an ID's animation data that changes its evaluated pose."""
+    animation_data = getattr(owner, "animation_data", None)
+    if animation_data is None:
+        return
+    action = getattr(animation_data, "action", None)
+    if action is not None and action not in seen_actions:
+        seen_actions.add(action)
+        hash_parts.append(f"A:{action.name}:" + get_action_hash(
+            action, slot=get_animation_data_action_slot(animation_data, action=action)
+        ))
+    hash_parts.append(f"nla:{getattr(animation_data, 'use_nla', False)}")
+    for track in getattr(animation_data, "nla_tracks", ()) or ():
+        hash_parts.append(f"T:{track.name}:{track.mute}:{getattr(track, 'is_solo', False)}")
+        for strip in track.strips:
+            hash_parts.append(repr((
+                strip.name, strip.frame_start, strip.frame_end,
+                strip.action_frame_start, strip.action_frame_end,
+                strip.scale, strip.repeat, strip.blend_type, strip.blend_in,
+                strip.blend_out, strip.influence, strip.mute,
+                strip.use_animated_influence, strip.use_animated_time,
+            )))
+            strip_action = getattr(strip, "action", None)
+            if strip_action is not None and strip_action not in seen_actions:
+                seen_actions.add(strip_action)
+                hash_parts.append(f"SA:{strip_action.name}:" + get_action_hash(strip_action))
+    for driver_curve in getattr(animation_data, "drivers", ()) or ():
+        driver = driver_curve.driver
+        hash_parts.append(
+            f"D:{driver_curve.data_path}:{driver_curve.array_index}:{driver_curve.mute}:"
+            f"{driver.type}:{driver.expression}"
+        )
+        for variable in driver.variables:
+            for target in variable.targets:
+                target_id = getattr(target, "id", None)
+                hash_parts.append(repr((
+                    variable.name, variable.type,
+                    getattr(target_id, "name", ""), target.data_path,
+                    getattr(target, "bone_target", ""),
+                    getattr(target, "transform_type", ""),
+                )))
+        _keyframe_hash_parts([driver_curve], hash_parts)
+
+
 def get_armature_timeline_hash(armature_name):
-    """Get combined hash of action and timeline for an armature"""
+    """Hash of everything the exporter reads for an armature.
+
+    Live sync uses this to notice changes. Hashing only the active action
+    missed NLA edits, constraint and control-rig animation, drivers, frame
+    step and exact frame-rate changes, and bone rest edits.
+    """
     obj = get_object_by_name(armature_name)
     if not obj or obj.type != "ARMATURE":
         return ""
 
-    action = obj.animation_data.action if obj.animation_data else None
-    action_hash = get_action_hash(action)
-    timeline_hash = get_timeline_hash()
+    hash_parts = []
+    seen_actions = set()
+    _animation_data_hash_parts(obj, hash_parts, seen_actions)
+    _animation_data_hash_parts(obj.data, hash_parts, seen_actions)
 
-    # Combine action and timeline hashes
-    combined_data = f"{action_hash}:{timeline_hash}"
-    return hashlib.md5(combined_data.encode("utf-8")).hexdigest()
+    seen_targets = {obj}
+    for pose_bone in obj.pose.bones:
+        for constraint in pose_bone.constraints:
+            hash_parts.append(
+                f"C:{pose_bone.name}:{constraint.name}:{constraint.type}:"
+                f"{getattr(constraint, 'mute', False)}:{getattr(constraint, 'influence', 1.0)}"
+            )
+            for attr in ("target", "pole_target"):
+                target = getattr(constraint, attr, None)
+                if target is not None and target not in seen_targets:
+                    seen_targets.add(target)
+                    hash_parts.append(f"CT:{target.name}")
+                    _animation_data_hash_parts(target, hash_parts, seen_actions)
+
+    for bone in obj.data.bones:
+        parent_name = bone.parent.name if bone.parent else ""
+        rest = tuple(round(value, 5) for row in bone.matrix_local for value in row)
+        hash_parts.append(f"B:{bone.name}:{parent_name}:{rest}")
+
+    hash_parts.append(get_timeline_hash())
+    return hashlib.md5("|".join(hash_parts).encode("utf-8")).hexdigest()
 
 
 def get_cached_armature_hash(armature_name):
-    """Get cached combined hash (action + timeline) or compute if cache is stale"""
-    global _action_hash_cache, _action_hash_cache_timestamp
-
+    """Combined hash for an armature, recomputed at most every HASH_CACHE_DURATION."""
     if not armature_name:
         return ""
 
     current_time = time.time()
-    cache_key = f"{armature_name}_combined"  # Use armature name as cache key
-
-    if (
-        cache_key not in _action_hash_cache
-        or current_time - _action_hash_cache_timestamp > HASH_CACHE_DURATION
-    ):
-        # Refresh cache with combined hash
-        _action_hash_cache[cache_key] = get_armature_timeline_hash(armature_name)
-        _action_hash_cache_timestamp = current_time
-
-    return _action_hash_cache[cache_key]
+    cached = _action_hash_cache.get(armature_name)
+    if cached is None or current_time - cached[1] > HASH_CACHE_DURATION:
+        cached = (get_armature_timeline_hash(armature_name), current_time)
+        _action_hash_cache[armature_name] = cached
+    return cached[0]
 
 
 def get_cached_armatures():
@@ -726,3 +789,52 @@ def get_scene_fps():
     scene = bpy.context.scene
     fps = scene.render.fps / scene.render.fps_base
     return max(fps, 1.0)
+
+
+# Data-path parsing ---------------------------------------------------------
+
+_POSE_BONE_PATH_RE = re.compile(r'pose\.bones\["((?:[^"\\]|\\.)*)"\]')
+_ESCAPE_RE = re.compile(r"\\(.)")
+
+
+class _PoseBoneMatch:
+    """Match-like result whose group(1) is the unescaped bone name."""
+
+    __slots__ = ("_match", "_name")
+
+    def __init__(self, match):
+        self._match = match
+        self._name = _ESCAPE_RE.sub(r"\1", match.group(1))
+
+    def group(self, index=0):
+        return self._name if index == 1 else self._match.group(index)
+
+    def end(self, index=0):
+        return self._match.end(index)
+
+
+class _PoseBonePathPattern:
+    """Drop-in for the old lazy ``pose.bones["(.+?)"]`` bone-name regex.
+
+    Blender escapes '"' and '\' inside bone names in data paths
+    (``bpy.utils.escape_identifier``); the old lazy regex stopped at the first
+    escaped quote and never unescaped, so such bones fell out of keyframe
+    tracking.
+    """
+
+    def search(self, data_path):
+        match = _POSE_BONE_PATH_RE.search(data_path or "")
+        return _PoseBoneMatch(match) if match else None
+
+    def match(self, data_path):
+        match = _POSE_BONE_PATH_RE.match(data_path or "")
+        return _PoseBoneMatch(match) if match else None
+
+
+POSE_BONE_PATH_PATTERN = _PoseBonePathPattern()
+
+
+def pose_bone_name_from_data_path(data_path):
+    """The bone name in a ``pose.bones["..."]`` data path, unescaped, or None."""
+    match = POSE_BONE_PATH_PATTERN.search(data_path)
+    return match.group(1) if match else None

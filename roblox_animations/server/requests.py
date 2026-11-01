@@ -10,9 +10,7 @@ import bpy
 import bpy_extras
 from mathutils import Matrix
 from ..core.utils import (
-    get_action_hash,
     get_scene_fps,
-    set_scene_fps,
     cf_to_mat,
     get_object_by_name,
     iter_scene_objects,
@@ -25,12 +23,14 @@ from ..animation.serialization import (
 )
 from ..animation.import_export import import_animation_preserve_ik
 from ..animation.import_easing import sample_import_keyframes
-from .live_sync_delta import animation_revision, create_delta
+from .live_sync_delta import animation_revision, create_delta, sanitize_non_finite
+from ..core.editor_state import edit_mode_message, preserved_editor_state
 
 
 # Global request queues
 pending_requests = []
 pending_responses = {}
+# (armature, calibration) -> (serialized animation, revision); insertion-ordered LRU.
 live_sync_snapshots = {}
 
 transform_to_blender = bpy_extras.io_utils.axis_conversion(
@@ -73,26 +73,59 @@ def _resolve_deform_translation_scale(export_info):
     return candidate
 
 
+def build_pose_bone_resolver(armature, is_deform_rig):
+    """Map Roblox channel names to pose bones.
+
+    Bones keep the Roblox part/bone name in ``rbx_source_name`` because the
+    Blender name can differ: Blender adds ".001" suffixes to duplicates and
+    truncates names longer than 63 bytes, and users rename bones. Lookups try
+    the source name first, then the Blender name. Deform rigs prefer deform
+    bones; Motor6D rigs prefer joint bones.
+    """
+    candidates = {}
+    for pose_bone in armature.pose.bones:
+        data = pose_bone.bone
+        source = data.get("rbx_source_name")
+        is_deform = bool(data.get("rbx_is_deform_bone", False))
+        structural = pose_bone.name.startswith("__RBX_STRUCTURAL__")
+        names = {pose_bone.name}
+        if isinstance(source, str) and source:
+            names.add(source)
+        for name in names:
+            candidates.setdefault(name, []).append(
+                (pose_bone, is_deform, structural, name == source)
+            )
+
+    def score(entry):
+        _pose_bone, is_deform, structural, by_source = entry
+        type_match = is_deform if is_deform_rig else not is_deform
+        return (type_match, not structural, by_source)
+
+    def legacy_deform_match(channel_name):
+        # Older deform imports named the deform twin "<name>.001" without
+        # storing the source name.
+        for pose_bone in armature.pose.bones:
+            if pose_bone.bone.get("rbx_is_deform_bone", False) and pose_bone.name.startswith(
+                f"{channel_name}."
+            ) and "rbx_source_name" not in pose_bone.bone:
+                return pose_bone
+        return None
+
+    def resolve(channel_name):
+        entries = candidates.get(channel_name)
+        best = max(entries, key=score) if entries else None
+        if is_deform_rig and (best is None or not best[1]):
+            legacy = legacy_deform_match(channel_name)
+            if legacy is not None:
+                return legacy
+        return best[0] if best else None
+
+    return resolve
+
+
 def _find_animation_pose_bone(armature, bone_name, is_deform_rig):
-    exact = armature.pose.bones.get(bone_name)
-    if not is_deform_rig:
-        return exact
-
-    deform_matches = []
-    for candidate in armature.pose.bones:
-        source_name = candidate.bone.get("rbx_source_name", candidate.name)
-        legacy_name_match = candidate.name == bone_name or candidate.name.startswith(
-            f"{bone_name}."
-        )
-        if (
-            candidate.bone.get("rbx_is_deform_bone", False)
-            and (source_name == bone_name or legacy_name_match)
-        ):
-            deform_matches.append(candidate)
-
-    if deform_matches:
-        return deform_matches[0]
-    return exact
+    """Backward-compatible single lookup (builds a resolver each call)."""
+    return build_pose_bone_resolver(armature, is_deform_rig)(bone_name)
 
 
 def _get_timeline_scene_for_armature(context_scene, armature):
@@ -189,8 +222,6 @@ def process_pending_requests():
 def execute_list_armatures(task_id):
     """Execute the armature listing in the main thread"""
     try:
-        print("Blender Addon: Executing list_armatures in main thread...")
-
         # Force refresh by invalidating cache first
         utils.invalidate_armature_cache()
 
@@ -225,12 +256,6 @@ def execute_list_armatures(task_id):
                 }
                 armatures.append(armature_info)
 
-                # Pre-cache the hash for this armature
-                action = obj.animation_data.action if obj.animation_data else None
-                utils.armature_anim_hashes[obj.name] = get_action_hash(action)
-
-        found_armature_names = [a["name"] for a in armatures]
-        print(f"Blender Addon: Found armatures: {found_armature_names}")
 
         response = {
             "armatures": armatures,
@@ -243,9 +268,6 @@ def execute_list_armatures(task_id):
         }
 
         data = json.dumps(response).encode("utf-8")
-        print(
-            f"Blender Addon: Prepared response for task {task_id}. Armature count: {len(armatures)}"
-        )
         pending_responses[task_id] = (True, data)
 
     except Exception as e:
@@ -257,8 +279,26 @@ def execute_list_armatures(task_id):
         )
 
 
+_LIVE_SYNC_SNAPSHOT_LIMIT = 8
+
+
+def _remember_snapshot(cache_key, animation, revision):
+    """Keep the last few live-sync payloads (one per armature/calibration)."""
+    live_sync_snapshots.pop(cache_key, None)
+    live_sync_snapshots[cache_key] = (animation, revision)
+    while len(live_sync_snapshots) > _LIVE_SYNC_SNAPSHOT_LIMIT:
+        live_sync_snapshots.pop(next(iter(live_sync_snapshots)))
+
+
+def _add_export_warning(serialized, message):
+    export_info = serialized.setdefault("export_info", {})
+    warnings = export_info.setdefault("warnings", [])
+    if message not in warnings:
+        warnings.append(message)
+
+
 def execute_in_main_thread(task_id, armature_name, target_bone_rest=None, live_preview=False, delta_base_hash=None):
-    """Execute the animation export in the main thread"""
+    """Export the armature's animation. Never changes the scene or the editor."""
     try:
         if not armature_name:
             pending_responses[task_id] = (False, "No armature selected")
@@ -280,14 +320,11 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None, live_p
             )
             return
 
-        bpy.context.view_layer.objects.active = ao
-        # Only switch mode if necessary to avoid expensive operations
-        if ao.mode != "POSE":
-            print(f"Blender Addon: Switching to POSE mode for '{armature_name}'...")
-            bpy.ops.object.mode_set(mode="POSE")
+        if ao.mode == "EDIT":
+            pending_responses[task_id] = (False, edit_mode_message(ao))
+            return
 
         desired_fps = get_scene_fps()
-        set_scene_fps(desired_fps)
 
         # Check if this is a deform bone rig or if deform bone serialization is forced
         settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
@@ -297,7 +334,6 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None, live_p
         print(
             f"Server export: Using {'deform bone' if use_deform_bone_serialization else 'Motor6D'} serialization"
         )
-        print(f"Blender Addon: Starting animation export for '{armature_name}'...")
 
         context_scene = bpy.context.scene
 
@@ -356,7 +392,8 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None, live_p
             if changed_scene_timeline:
                 context_scene.frame_start = original_frame_start
                 context_scene.frame_end = original_frame_end
-            context_scene.frame_step = original_frame_step
+            if int(getattr(context_scene, "frame_step", 1) or 1) != original_frame_step:
+                context_scene.frame_step = original_frame_step
 
         if not serialized:
             pending_responses[task_id] = (
@@ -372,15 +409,25 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None, live_p
             )
             return
 
+        # JSON has no NaN; one degenerate matrix used to fail the whole sync.
+        serialized, replaced = sanitize_non_finite(serialized)
+        if replaced:
+            _add_export_warning(
+                serialized,
+                f"{replaced} invalid (NaN/infinite) values were replaced with 0. "
+                "A bone may have zero scale or a broken constraint.",
+            )
+
         if delta_base_hash is not None:
             calibration_key = json.dumps(target_bone_rest, sort_keys=True,
                                          separators=(",", ":")) if target_bone_rest else ""
             cache_key = (armature_name, calibration_key)
             previous = live_sync_snapshots.get(cache_key)
             current_hash = animation_revision(serialized)
-            delta = create_delta(previous, serialized) if previous and animation_revision(
-                previous) == delta_base_hash else None
-            live_sync_snapshots[cache_key] = serialized
+            delta = None
+            if previous and previous[1] == delta_base_hash:
+                delta = create_delta(previous[0], serialized, previous[1], current_hash)
+            _remember_snapshot(cache_key, serialized, current_hash)
             full_payload = {
                 "type": "animation_full",
                 "hash": current_hash,
@@ -406,8 +453,174 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None, live_p
         pending_responses[task_id] = (False, f"Error during export: {str(e)}")
 
 
+def _seconds_scale(export_info, scene_fps):
+    """Factor that converts payload times to seconds."""
+    if isinstance(export_info, dict) and export_info.get("time_unit") == "frames":
+        try:
+            source_fps = float(export_info.get("fps") or scene_fps)
+        except (TypeError, ValueError):
+            source_fps = scene_fps
+        if source_fps > 0:
+            return 1.0 / source_fps
+    return 1.0
+
+
+def _ensure_action_slot(action, ao):
+    """Blender 4.4+ actions animate through slots."""
+    if not hasattr(action, "slots"):
+        return
+    if action.slots:
+        active_slot = action.slots[0]
+    else:
+        try:
+            active_slot = action.slots.new(id_type="OBJECT", name=f"OB{ao.name}")
+        except TypeError:
+            active_slot = action.slots.new(id_type="OBJECT")
+    if active_slot and hasattr(ao.animation_data, "action_slot"):
+        try:
+            ao.animation_data.action_slot = active_slot
+        except Exception:
+            pass
+
+
+def _channelbag_for(action):
+    channelbag = utils.get_action_channelbag(action)
+    if channelbag is None or not hasattr(channelbag, "fcurves"):
+        legacy_fcurves = getattr(action, "fcurves", None)
+        if legacy_fcurves is None:
+            raise RuntimeError("Unable to access animation channelbag for import")
+
+        class _LegacyChannelbag:
+            def __init__(self, fcurves, groups):
+                self.fcurves = fcurves
+                self.groups = groups
+
+        channelbag = _LegacyChannelbag(legacy_fcurves, getattr(action, "groups", []))
+    return channelbag
+
+
+def _make_fcurve_factory(action, channelbag):
+    group_collections = []
+    action_groups = getattr(action, "groups", None)
+    if action_groups is not None:
+        group_collections.append(action_groups)
+    channelbag_groups = getattr(channelbag, "groups", None)
+    if channelbag_groups is not None and channelbag_groups is not action_groups:
+        group_collections.append(channelbag_groups)
+
+    def ensure_group(group_name):
+        for group_collection in group_collections:
+            if group_collection is None:
+                continue
+            try:
+                existing = group_collection.get(group_name)
+            except Exception:
+                existing = None
+            if existing is not None:
+                return existing
+            try:
+                return group_collection.new(name=group_name)
+            except TypeError:
+                try:
+                    return group_collection.new(group_name)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+        return None
+
+    def create_fcurve(data_path, index, group_name):
+        fcurve = None
+        try:
+            fcurve = channelbag.fcurves.new(data_path, index=index)
+        except TypeError:
+            for candidate in ("group_name", "action_group"):
+                try:
+                    fcurve = channelbag.fcurves.new(
+                        data_path, index=index, **{candidate: group_name}
+                    )
+                    break
+                except TypeError:
+                    continue
+            if fcurve is None:
+                fcurve = channelbag.fcurves.new(data_path, index=index)
+        group = ensure_group(group_name)
+        if group is not None and hasattr(fcurve, "group"):
+            try:
+                fcurve.group = group
+            except Exception:
+                pass
+        return fcurve
+
+    return create_fcurve
+
+
+def _import_markers(action, markers, start_frame, fps, seconds_scale):
+    """Studio keyframe names and KeyframeMarkers become action pose markers."""
+    if not isinstance(markers, list) or not markers:
+        return 0
+    created = 0
+    exact = []
+    for marker in markers:
+        if not isinstance(marker, dict):
+            continue
+        name = str(marker.get("name") or "").strip()
+        try:
+            seconds = float(marker.get("time", 0.0)) * seconds_scale
+        except (TypeError, ValueError):
+            continue
+        if not name:
+            continue
+        frame = int(round(start_frame + seconds * fps))
+        value = str(marker.get("value") or "")
+        marker_type = "Event" if marker.get("type") == "Event" else "Name"
+        label = f"{name}: {value}" if value else name
+        try:
+            pose_marker = action.pose_markers.new(label)
+            pose_marker.frame = frame
+            created += 1
+        except Exception:
+            continue
+        exact.append({"label": label, "frame": frame, "name": name, "value": value,
+                      "type": marker_type, "time": seconds})
+    if exact:
+        action["rbx_markers"] = json.dumps(exact, separators=(",", ":"))
+    return created
+
+
+def _import_face_controls(ao, keyframes, create_fcurve, start_frame, fps):
+    """Key the armature's face-control sliders from Studio NumberPose data.
+
+    ``keyframes`` times must already be in seconds.
+    """
+    from ..animation.face_controls import face_control_property_name  # noqa: PLC0415
+    from ..animation.import_easing import sample_face_control_tracks  # noqa: PLC0415
+
+    holder = getattr(ao, "rbx_face_controls", None)
+    tracks = sample_face_control_tracks(keyframes, fps)
+    keyed, missing = 0, []
+    for control_name, samples in tracks.items():
+        prop = face_control_property_name(control_name)
+        if holder is None or not hasattr(holder, prop):
+            missing.append(control_name)
+            continue
+        fcurve = create_fcurve(f"rbx_face_controls.{prop}", 0, "Face Controls")
+        fcurve.keyframe_points.add(len(samples))
+        for index, (frame, value, constant) in enumerate(samples):
+            point = fcurve.keyframe_points[index]
+            point.co = (start_frame + frame, value)
+            point.interpolation = "CONSTANT" if constant else "LINEAR"
+        fcurve.keyframe_points.handles_recalc()
+        keyed += 1
+    return keyed, missing
+
+
 def execute_import_animation(task_id, animation_data, target_armature=None):
-    """Execute the animation import in the main thread with IK preservation."""
+    """Import a Studio animation into a NEW action on the armature.
+
+    The previous action is kept (with a fake user, so saving can't drop it);
+    drivers, NLA tracks, the scene FPS and the editor state are left alone.
+    """
     try:
         # Use target armature if provided, otherwise fall back to scene selection
         if target_armature:
@@ -422,85 +635,62 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
             )
 
         ao = get_object_by_name(armature_name)
-        if not ao:
+        if not ao or ao.type != "ARMATURE":
             raise ValueError(
                 f"Selected object '{armature_name}' is not a valid armature."
             )
-
-        if ao.type != "ARMATURE":
+        if ao.mode == "EDIT":
+            raise ValueError(edit_mode_message(ao))
+        if ao.animation_data and getattr(ao.animation_data, "use_tweak_mode", False):
             raise ValueError(
-                f"Selected object '{armature_name}' is not a valid armature."
+                f"'{ao.name}' is in NLA tweak mode. Exit tweak mode, then import again."
             )
+        if not isinstance(animation_data.get("kfs"), list):
+            raise ValueError("Animation data has no keyframes.")
 
-        bpy.context.view_layer.objects.active = ao
-        if ao.mode != "POSE":
-            bpy.ops.object.mode_set(mode="POSE")
+        summary = {}
 
         def _do_import():
-            # Clear existing animation data
-            if ao.animation_data:
-                ao.animation_data_clear()
-
-            # Reset pose to rest position to ensure a clean slate
-            if ao.pose:
-                for bone in ao.pose.bones:
-                    bone.matrix_basis = Matrix.Identity(4)
-                bpy.context.view_layer.update()  # Ensure the pose update is registered
-
-            action = bpy.data.actions.new(name=f"{armature_name}_ImportedAnimation")
-            ao.animation_data_create()
-            ao.animation_data.action = action
-
-            # Ensure a compatible action slot exists (Blender 4.4+)
-            active_slot = None
-            if hasattr(action, "slots"):
-                if action.slots:
-                    active_slot = action.slots[0]
-                else:
-                    try:
-                        active_slot = action.slots.new(
-                            id_type="OBJECT", name=f"OB{ao.name}"
-                        )
-                    except TypeError:
-                        active_slot = action.slots.new(id_type="OBJECT")
-                if active_slot and hasattr(ao.animation_data, "action_slot"):
-                    try:
-                        ao.animation_data.action_slot = active_slot
-                    except Exception:
-                        pass
-            else:
-                pass
-
-            export_info = animation_data.get("export_info", {})
-            fps = export_info.get("fps", get_scene_fps())
-            set_scene_fps(fps)
-
-            deform_translation_scale = _resolve_deform_translation_scale(export_info)
-
             scene = bpy.context.scene
-            scene.frame_start = 0
-            scene.frame_end = math.ceil(round(animation_data["t"] * fps, 6))
+            fps = get_scene_fps()
+            export_info = animation_data.get("export_info", {}) or {}
+            seconds_scale = _seconds_scale(export_info, fps)
+            deform_translation_scale = _resolve_deform_translation_scale(export_info)
+            is_deform_rig = bool(
+                animation_data.get("is_deform_bone_rig", False)
+                or animation_data.get("is_deform_rig", False)
+            )
+            start_frame = int(scene.frame_start)
 
-            is_deform_rig = animation_data.get("is_deform_bone_rig", False)
+            ad = ao.animation_data_create()
+            previous_action = ad.action
+            if previous_action is not None:
+                # Keep the old animation in the file and in the action list.
+                previous_action.use_fake_user = True
+            previous_use_nla = bool(getattr(ad, "use_nla", True))
 
-            # This will store all transform data for all bones across all frames before we create any keyframes.
-            # Format: { bone_name: { frame: {"location": Vector, "rotation": Quaternion, "scale": Vector}, ... }, ... }
-            all_bone_data = {}
+            action = bpy.data.actions.new(name=f"{ao.name}_ImportedAnimation")
+            ad.action = action
+            _ensure_action_slot(action, ao)
 
-            # Reset pose to rest position and pre-populate all transformable bones
-            # with their rest pose at the start frame. This ensures a defined initial state.
-            if ao.pose:
+            # NLA strips would be layered under the pose we're converting.
+            if previous_use_nla and getattr(ad, "nla_tracks", None):
+                ad.use_nla = False
+
+            try:
+                # Rest pose for a clean, deterministic conversion.
                 for bone in ao.pose.bones:
                     bone.matrix_basis = Matrix.Identity(4)
                 bpy.context.view_layer.update()
 
-                start_frame = scene.frame_start
+                resolve = build_pose_bone_resolver(ao, is_deform_rig)
+
+                # { bone_name: { frame: {"location", "rotation_quaternion", "scale", ...} } }
+                all_bone_data = {}
                 for bone in ao.pose.bones:
                     if is_deform_rig:
                         is_transformable = bone.bone.use_deform
                     else:
-                        # Handle both boolean True and integer 1 for backward compatibility
-                        # We check truthiness to support both True (bool) and 1 (int)
                         is_transformable = bool(bone.bone.get("is_transformable", False))
                     if is_transformable:
                         all_bone_data[bone.name] = {
@@ -511,18 +701,28 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                             }
                         }
 
-            for kf_data in sample_import_keyframes(animation_data["kfs"], fps):
-                frame = kf_data["t"] * fps
-                state = kf_data["kf"]
+                unmatched = set()
+                matched = set()
+                keyframes = [kf for kf in animation_data["kfs"] if isinstance(kf, dict)]
+                for kf in keyframes:
+                    if not isinstance(kf.get("kf"), dict):
+                        kf["kf"] = {}
+                    if seconds_scale != 1.0:
+                        kf["t"] = float(kf.get("t", 0.0)) * seconds_scale
 
-                bones_to_process = []
-                for source_bone_name in state.keys():
-                    pose_bone = _find_animation_pose_bone(
-                        ao,
-                        source_bone_name,
-                        is_deform_rig,
-                    )
-                    if pose_bone:
+                for kf_data in sample_import_keyframes(keyframes, fps):
+                    frame = start_frame + kf_data["t"] * fps
+                    state = kf_data["kf"]
+
+                    bones_to_process = []
+                    for source_bone_name in state.keys():
+                        if source_bone_name.endswith("_deform"):
+                            continue
+                        pose_bone = resolve(source_bone_name)
+                        if pose_bone is None:
+                            unmatched.add(source_bone_name)
+                            continue
+                        matched.add(pose_bone.name)
                         if (
                             is_deform_rig
                             and pose_bone.bone.get("rbx_is_deform_bone", False)
@@ -531,299 +731,237 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                             pose_bone.bone["rbx_source_name"] = source_bone_name
                         bones_to_process.append((pose_bone, source_bone_name))
 
-                bones_to_process.sort(key=lambda item: len(item[0].parent_recursive))
+                    bones_to_process.sort(key=lambda item: len(item[0].parent_recursive))
 
-                # Simplified single-pass processing loop.
-                # By iterating through bones sorted by hierarchy (parents first), we ensure
-                # that when we calculate a child's matrix, the parent's matrix for the
-                # current frame has already been set.
-                for pose_bone, source_bone_name in bones_to_process:
-                    bone_name = pose_bone.name
-                    pose_bone.rotation_mode = "QUATERNION"
-                    pose_data = state.get(source_bone_name)
-                    if not pose_data:
-                        continue
+                    # Parents first, so a child's conversion sees its parent's
+                    # pose for this frame.
+                    for pose_bone, source_bone_name in bones_to_process:
+                        bone_name = pose_bone.name
+                        pose_bone.rotation_mode = "QUATERNION"
+                        pose_data = state.get(source_bone_name)
+                        if not pose_data:
+                            continue
 
-                    if bone_name not in all_bone_data:
-                        all_bone_data[bone_name] = {
-                            start_frame: {
+                        if bone_name not in all_bone_data:
+                            all_bone_data[bone_name] = {
+                                start_frame: {
+                                    "location": pose_bone.location.copy(),
+                                    "rotation_quaternion": pose_bone.rotation_quaternion.copy(),
+                                    "scale": pose_bone.scale.copy(),
+                                }
+                            }
+
+                        easing_style = "Linear"
+                        cframe_components = None
+                        if isinstance(pose_data, list) and len(pose_data) == 3 and isinstance(
+                            pose_data[0], (list, tuple)
+                        ):
+                            cframe_components = pose_data[0]
+                            easing_style = pose_data[1]
+                        elif isinstance(pose_data, dict):
+                            cframe_components = pose_data.get("components", [])
+                            easing_style = pose_data.get("easingStyle", "Linear")
+                        elif isinstance(pose_data, list):
+                            cframe_components = pose_data
+
+                        if not cframe_components or len(cframe_components) < 12:
+                            continue
+
+                        bone_transform = cf_to_mat(cframe_components)
+
+                        joint_props = (
+                            "nicetransform" in pose_bone.bone
+                            and "transform" in pose_bone.bone
+                            and "transform1" in pose_bone.bone
+                        )
+                        # A Motor6D bone that also deforms a skinned mesh is
+                        # still a Motor6D channel: the exporter samples it with
+                        # the Motor6D math, so the import must invert that.
+                        is_deform_bone = is_deform_rig and bool(
+                            pose_bone.bone.get("rbx_is_deform_bone", False)
+                            or (pose_bone.bone.use_deform and not joint_props)
+                        )
+                        has_motor6d_props = (not is_deform_bone) and joint_props
+
+                        if is_deform_bone:
+                            # Imported Bone deltas use the Roblox rest basis. A
+                            # rebuilt display bone may point along a different axis;
+                            # conjugate by nicetransform to preserve the same motion.
+                            if pose_bone.bone.get("rbx_joint_type") == "Bone" and "transform" in pose_bone.bone:
+                                basis = bone_transform.copy()
+                                if deform_translation_scale != 1.0:
+                                    basis.translation = basis.to_translation() * float(deform_translation_scale)
+                                nice = utils.to_matrix(pose_bone.bone.get("nicetransform"))
+                                basis = nice.inverted() @ basis @ nice
+                                pose_bone.matrix_basis = basis
+                            else:
+                                pose_bone.matrix_basis = _roblox_deform_delta_to_blender(
+                                    bone_transform,
+                                    deform_translation_scale,
+                                )
+                        elif not has_motor6d_props:
+                            # Helper bones without Motor6D metadata retain the legacy
+                            # object-axis conversion.
+                            pose_bone.matrix_basis = (
+                                transform_to_blender
+                                @ bone_transform
+                                @ transform_to_blender.inverted()
+                            )
+                        else:  # Motor6D rig
+                            back_trans = transform_to_blender.inverted()
+                            extr_transform = Matrix(pose_bone.bone["nicetransform"]).inverted()
+
+                            orig_mat = Matrix(pose_bone.bone["transform"])
+                            orig_mat_tr1 = Matrix(pose_bone.bone["transform1"])
+
+                            if pose_bone.parent and "transform" in pose_bone.parent.bone:
+                                parent_orig_mat = Matrix(pose_bone.parent.bone["transform"])
+                                parent_orig_mat_tr1 = Matrix(
+                                    pose_bone.parent.bone["transform1"]
+                                )
+
+                                orig_base_mat = back_trans @ (orig_mat @ orig_mat_tr1)
+                                parent_orig_base_mat = back_trans @ (
+                                    parent_orig_mat @ parent_orig_mat_tr1
+                                )
+                                orig_transform = parent_orig_base_mat.inverted() @ orig_base_mat
+
+                                cur_transform = orig_transform @ bone_transform
+
+                                parent_extr_transform = Matrix(
+                                    pose_bone.parent.bone["nicetransform"]
+                                ).inverted()
+
+                                parent_matrix = pose_bone.parent.matrix
+                                parent_obj_transform = back_trans @ (
+                                    parent_matrix @ parent_extr_transform
+                                )
+
+                                cur_obj_transform = parent_obj_transform @ cur_transform
+                            else:
+                                cur_obj_transform = bone_transform
+
+                            final_matrix = (
+                                transform_to_blender
+                                @ cur_obj_transform
+                                @ extr_transform.inverted()
+                            )
+                            pose_bone.matrix = final_matrix
+
+                        if bone_name in all_bone_data:
+                            all_bone_data[bone_name][frame] = {
                                 "location": pose_bone.location.copy(),
                                 "rotation_quaternion": pose_bone.rotation_quaternion.copy(),
                                 "scale": pose_bone.scale.copy(),
+                                "easingStyle": easing_style,
                             }
-                        }
 
-                    # Backwards compatibility: Handle old list-based format and new dict-based format.
-                    easing_style = "Linear"  # Default easing
-                    easing_direction = "In"  # Default easing
+                channelbag = _channelbag_for(action)
+                create_fcurve = _make_fcurve_factory(action, channelbag)
 
-                    if isinstance(pose_data, list) and len(pose_data) == 3:
-                        # New, more robust format: [ [cframe_components], "EasingStyle", "EasingDirection" ]
-                        cframe_components = pose_data[0]
-                        easing_style = pose_data[1]
-                        easing_direction = pose_data[2]
-                    elif isinstance(pose_data, dict):
-                        # old format with easing styles
-                        cframe_components = pose_data.get("components", [])
-                        easing_style = pose_data.get("easingStyle", "Linear")
-                        easing_direction = pose_data.get("easingDirection", "In")
-                    elif isinstance(pose_data, list):
-                        # oldest format, just a list of cframe components
-                        cframe_components = pose_data
+                for bone_name, frame_data in all_bone_data.items():
+                    sorted_frames = sorted(frame_data.keys())
+                    # Blender interpolates quaternion components; keep adjacent signs
+                    # aligned so equivalent q/-q values cannot introduce a flip.
+                    for previous, current in zip(sorted_frames, sorted_frames[1:]):
+                        a = frame_data[previous]["rotation_quaternion"]
+                        b = frame_data[current]["rotation_quaternion"]
+                        if a.dot(b) < 0:
+                            b.negate()
 
-                    if not cframe_components:
+                    escaped = bpy.utils.escape_identifier(bone_name)
+                    loc_fcurves = [
+                        create_fcurve(f'pose.bones["{escaped}"].location', i, bone_name)
+                        for i in range(3)
+                    ]
+                    rot_fcurves = [
+                        create_fcurve(f'pose.bones["{escaped}"].rotation_quaternion', i, bone_name)
+                        for i in range(4)
+                    ]
+                    scale_fcurves = [
+                        create_fcurve(f'pose.bones["{escaped}"].scale', i, bone_name)
+                        for i in range(3)
+                    ]
+
+                    num_frames = len(sorted_frames)
+                    if num_frames == 0:
                         continue
 
-                    bone_transform = cf_to_mat(cframe_components)
+                    for fcurve in loc_fcurves + rot_fcurves + scale_fcurves:
+                        fcurve.keyframe_points.add(num_frames)
 
-                    # --- Matrix Calculation ---
-                    # Check if this bone has Motor6D properties (from rig build)
-                    is_deform_bone = is_deform_rig and bool(
-                        pose_bone.bone.get("rbx_is_deform_bone", False)
-                        or pose_bone.bone.use_deform
-                    )
-                    has_motor6d_props = (not is_deform_bone) and (
-                        "nicetransform" in pose_bone.bone
-                        and "transform" in pose_bone.bone
-                        and "transform1" in pose_bone.bone
-                    )
-
-                    if is_deform_bone:
-                        # Imported Bone deltas use the Roblox rest basis. A
-                        # rebuilt display bone may point along a different axis;
-                        # conjugate by nicetransform to preserve the same motion.
-                        if pose_bone.bone.get("rbx_joint_type") == "Bone" and "transform" in pose_bone.bone:
-                            basis = bone_transform.copy()
-                            if deform_translation_scale != 1.0:
-                                basis.translation = basis.to_translation() * float(deform_translation_scale)
-                            nice = utils.to_matrix(pose_bone.bone.get("nicetransform"))
-                            basis = nice.inverted() @ basis @ nice
-                            pose_bone.matrix_basis = basis
-                        else:
-                            pose_bone.matrix_basis = _roblox_deform_delta_to_blender(
-                                bone_transform,
-                                deform_translation_scale,
-                            )
-                    elif not has_motor6d_props:
-                        # Helper bones without Motor6D metadata retain the legacy
-                        # object-axis conversion.
-                        pose_bone.matrix_basis = (
-                            transform_to_blender
-                            @ bone_transform
-                            @ transform_to_blender.inverted()
+                    for idx, frame in enumerate(sorted_frames):
+                        transforms = frame_data[frame]
+                        loc = transforms["location"]
+                        rot = transforms["rotation_quaternion"]
+                        scl = transforms["scale"]
+                        interpolation = (
+                            "CONSTANT" if transforms.get("easingStyle") == "Constant"
+                            else "LINEAR"
                         )
-                    else:  # Motor6D rig
-                        back_trans = transform_to_blender.inverted()
-                        extr_transform = Matrix(pose_bone.bone["nicetransform"]).inverted()
+                        for fcurves, values, count in (
+                            (loc_fcurves, loc, 3),
+                            (rot_fcurves, rot, 4),
+                            (scale_fcurves, scl, 3),
+                        ):
+                            for axis in range(count):
+                                kp = fcurves[axis].keyframe_points[idx]
+                                kp.co = (frame, values[axis])
+                                kp.interpolation = interpolation
+                                kp.handle_left_type = kp.handle_right_type = "AUTO"
 
-                        orig_mat = Matrix(pose_bone.bone["transform"])
-                        orig_mat_tr1 = Matrix(pose_bone.bone["transform1"])
+                    # Keys were allocated in sorted order and only use LINEAR or
+                    # CONSTANT interpolation. FCurve.update() would deduplicate close
+                    # fractional keys and erase immediate Constant In jumps.
+                    for fcurve in loc_fcurves + rot_fcurves + scale_fcurves:
+                        fcurve.keyframe_points.handles_recalc()
 
-                        if pose_bone.parent and "transform" in pose_bone.parent.bone:
-                            parent_orig_mat = Matrix(pose_bone.parent.bone["transform"])
-                            parent_orig_mat_tr1 = Matrix(
-                                pose_bone.parent.bone["transform1"]
-                            )
+                face_keyed, face_missing = _import_face_controls(
+                    ao, keyframes, create_fcurve, start_frame, fps
+                )
+                marker_count = _import_markers(
+                    action, animation_data.get("markers"), start_frame, fps, seconds_scale
+                )
 
-                            orig_base_mat = back_trans @ (orig_mat @ orig_mat_tr1)
-                            parent_orig_base_mat = back_trans @ (
-                                parent_orig_mat @ parent_orig_mat_tr1
-                            )
-                            orig_transform = parent_orig_base_mat.inverted() @ orig_base_mat
+                # Make the whole animation visible on the timeline.
+                try:
+                    duration = float(animation_data.get("t", 0.0)) * seconds_scale
+                except (TypeError, ValueError):
+                    duration = 0.0
+                end_frame = start_frame + math.ceil(round(duration * fps, 6))
+                extended_range = end_frame > scene.frame_end
+                if extended_range:
+                    scene.frame_end = end_frame
 
-                            cur_transform = orig_transform @ bone_transform
+                driven = sorted(
+                    name for name in matched
+                    if name in serialization_driven_bones(ao)
+                )
+                summary.update({
+                    "action": action.name,
+                    "previous_action": previous_action.name if previous_action else None,
+                    "bones": len(matched),
+                    "unmatched": sorted(unmatched),
+                    "face_controls": face_keyed,
+                    "face_missing": face_missing,
+                    "markers": marker_count,
+                    "extended_range": end_frame if extended_range else None,
+                    "driven": driven,
+                })
+            finally:
+                if previous_use_nla and hasattr(ad, "use_nla"):
+                    ad.use_nla = True
 
-                            parent_extr_transform = Matrix(
-                                pose_bone.parent.bone["nicetransform"]
-                            ).inverted()
+        # Run import wrapped with IK preservation (FK import then bake back to
+        # IK). It needs the armature active in Pose Mode; the editor state is
+        # restored afterwards.
+        with preserved_editor_state():
+            bpy.context.view_layer.objects.active = ao
+            if ao.mode != "POSE":
+                bpy.ops.object.mode_set(mode="POSE")
+            import_animation_preserve_ik(_do_import)
 
-                            # Use the parent's current matrix from the pose, which was set in the previous iteration
-                            parent_matrix = pose_bone.parent.matrix
-                            parent_obj_transform = back_trans @ (
-                                parent_matrix @ parent_extr_transform
-                            )
-
-                            cur_obj_transform = parent_obj_transform @ cur_transform
-                        else:
-                            cur_obj_transform = bone_transform
-
-                        final_matrix = (
-                            transform_to_blender
-                            @ cur_obj_transform
-                            @ extr_transform.inverted()
-                        )
-
-                        # --- Apply Motor6D armature-space target ---
-                        pose_bone.matrix = final_matrix
-
-                    if bone_name in all_bone_data:
-                        all_bone_data[bone_name][frame] = {
-                            "location": pose_bone.location.copy(),
-                            "rotation_quaternion": pose_bone.rotation_quaternion.copy(),
-                            "scale": pose_bone.scale.copy(),
-                            "easingStyle": easing_style,
-                            "easingDirection": easing_direction,
-                        }
-
-            for bone_name, frame_data in all_bone_data.items():
-                sorted_frames = sorted(frame_data.keys())
-                # Blender interpolates quaternion components; keep adjacent signs
-                # aligned so equivalent q/-q values cannot introduce a flip.
-                for previous, current in zip(sorted_frames, sorted_frames[1:]):
-                    a = frame_data[previous]["rotation_quaternion"]
-                    b = frame_data[current]["rotation_quaternion"]
-                    if a.dot(b) < 0:
-                        b.negate()
-
-                channelbag = utils.get_action_channelbag(action)
-                if channelbag is None or not hasattr(channelbag, "fcurves"):
-                    legacy_fcurves = getattr(action, "fcurves", None)
-                    if legacy_fcurves is None:
-                        raise RuntimeError(
-                            "Unable to access animation channelbag for import"
-                        )
-
-                    class _LegacyChannelbag:
-                        def __init__(self, fcurves, groups):
-                            self.fcurves = fcurves
-                            self.groups = groups
-
-                        def new(self, *args, **kwargs):
-                            return self.fcurves.new(*args, **kwargs)
-
-                    channelbag = _LegacyChannelbag(
-                        legacy_fcurves, getattr(action, "groups", [])
-                    )
-
-                group_collections = []
-                action_groups = getattr(action, "groups", None)
-                if action_groups is not None:
-                    group_collections.append(action_groups)
-                channelbag_groups = getattr(channelbag, "groups", None)
-                if channelbag_groups is not None and channelbag_groups is not action_groups:
-                    group_collections.append(channelbag_groups)
-
-                def ensure_group(group_name):
-                    if not group_collections:
-                        return None
-                    for group_collection in group_collections:
-                        if group_collection is None:
-                            continue
-                        existing = None
-                        try:
-                            existing = group_collection.get(group_name)
-                        except Exception:
-                            existing = None
-                        if existing is not None:
-                            return existing
-                        try:
-                            return group_collection.new(name=group_name)
-                        except TypeError:
-                            try:
-                                return group_collection.new(group_name)
-                            except Exception:
-                                continue
-                        except Exception:
-                            continue
-                    return None
-
-                # Create fcurves with version-appropriate parameters
-                def create_fcurve(data_path, index, group_name):
-                    fcurve = None
-                    try:
-                        fcurve = channelbag.fcurves.new(data_path, index=index)
-                    except TypeError:
-                        if hasattr(channelbag.fcurves, "new"):
-                            for candidate in ("group_name", "action_group"):
-                                try:
-                                    fcurve = channelbag.fcurves.new(
-                                        data_path, index=index, **{candidate: group_name}
-                                    )
-                                    break
-                                except TypeError:
-                                    continue
-                        if fcurve is None:
-                            fcurve = channelbag.fcurves.new(data_path, index=index)
-
-                    group = ensure_group(group_name)
-                    if group is not None and hasattr(fcurve, "group"):
-                        try:
-                            fcurve.group = group
-                        except Exception:
-                            pass
-                    return fcurve
-
-                # Location
-                loc_fcurves = [
-                    create_fcurve(
-                        f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].location',
-                        i,
-                        bone_name,
-                    )
-                    for i in range(3)
-                ]
-                # Rotation
-                rot_fcurves = [
-                    create_fcurve(
-                        f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].rotation_quaternion',
-                        i,
-                        bone_name,
-                    )
-                    for i in range(4)
-                ]
-                # Scale
-                scale_fcurves = [
-                    create_fcurve(
-                        f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].scale',
-                        i,
-                        bone_name,
-                    )
-                    for i in range(3)
-                ]
-
-                num_frames = len(sorted_frames)
-                if num_frames == 0:
-                    continue
-
-                for fcurve in loc_fcurves + rot_fcurves + scale_fcurves:
-                    fcurve.keyframe_points.add(num_frames)
-
-                for idx, frame in enumerate(sorted_frames):
-                    transforms = frame_data[frame]
-                    loc = transforms["location"]
-                    rot = transforms["rotation_quaternion"]
-                    scl = transforms["scale"]
-                    interpolation = (
-                        "CONSTANT" if transforms.get("easingStyle") == "Constant"
-                        else "LINEAR"
-                    )
-
-                    for axis in range(3):
-                        kp = loc_fcurves[axis].keyframe_points[idx]
-                        kp.co = (frame, loc[axis])
-                        kp.interpolation = interpolation
-                        kp.handle_left_type = kp.handle_right_type = "AUTO"
-                    for axis in range(4):
-                        kp = rot_fcurves[axis].keyframe_points[idx]
-                        kp.co = (frame, rot[axis])
-                        kp.interpolation = interpolation
-                        kp.handle_left_type = kp.handle_right_type = "AUTO"
-                    for axis in range(3):
-                        kp = scale_fcurves[axis].keyframe_points[idx]
-                        kp.co = (frame, scl[axis])
-                        kp.interpolation = interpolation
-                        kp.handle_left_type = kp.handle_right_type = "AUTO"
-
-                # Keys were allocated in sorted order and only use LINEAR or
-                # CONSTANT interpolation. FCurve.update() would deduplicate close
-                # fractional keys and erase immediate Constant In jumps.
-                for fcurve in loc_fcurves + rot_fcurves + scale_fcurves:
-                    fcurve.keyframe_points.handles_recalc()
-
-            pending_responses[task_id] = (True, "Animation imported successfully")
-
-        # Run import wrapped with IK preservation (FK import then bake back to IK)
-        import_animation_preserve_ik(_do_import)
+        pending_responses[task_id] = (True, _import_summary_message(summary))
 
     except Exception as e:
         print(f"Error in main thread (import_animation): {str(e)}")
@@ -831,31 +969,55 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
         pending_responses[task_id] = (False, f"Error importing animation: {str(e)}")
 
 
+def serialization_driven_bones(ao):
+    from ..animation.serialization import get_all_driven_bones  # noqa: PLC0415
+
+    return get_all_driven_bones(ao)
+
+
+def _import_summary_message(summary):
+    parts = [f"Imported {summary.get('bones', 0)} bone(s) into action '{summary.get('action')}'."]
+    if summary.get("previous_action"):
+        parts.append(f"The previous action '{summary['previous_action']}' was kept.")
+    unmatched = summary.get("unmatched") or []
+    if unmatched:
+        shown = ", ".join(unmatched[:8]) + (f" (+{len(unmatched) - 8} more)" if len(unmatched) > 8 else "")
+        parts.append(f"{len(unmatched)} channel(s) have no matching bone: {shown}.")
+    if summary.get("face_controls"):
+        parts.append(f"Keyed {summary['face_controls']} face control(s).")
+    if summary.get("face_missing"):
+        parts.append(
+            f"{len(summary['face_missing'])} face control(s) have no slider on this rig."
+        )
+    if summary.get("markers"):
+        parts.append(f"Added {summary['markers']} marker(s).")
+    if summary.get("extended_range"):
+        parts.append(f"Extended the scene end to frame {summary['extended_range']}.")
+    if summary.get("driven"):
+        parts.append(
+            f"{len(summary['driven'])} bone(s) have drivers that override the imported keys: "
+            + ", ".join(summary["driven"][:5])
+            + "."
+        )
+    return " ".join(parts)
+
+
 def execute_get_bone_rest(task_id, armature_name):
     """
     Gets the rest pose for all bones in an armature.
-    This function uses the same rest pose calculation as the deform bone
-    serializer to ensure perfect consistency between the rig setup
-    and animation export.
-    """
-    original_mode = None
-    ao = None
-    saved_bone_matrices = {}
 
+    Read-only: it uses rest matrices and the stored Roblox joint data, so it
+    never changes the mode, the pose or the bone selection. It uses the same
+    rest calculation as the deform bone serializer, so the rig setup and the
+    animation export agree.
+    """
     try:
         if not armature_name:
             pending_responses[task_id] = (False, "No armature selected")
             return
 
         ao = get_object_by_name(armature_name)
-        if not ao:
-            pending_responses[task_id] = (
-                False,
-                f"Object '{armature_name}' is not a valid armature.",
-            )
-            return
-
-        if ao.type != "ARMATURE":
+        if not ao or ao.type != "ARMATURE":
             pending_responses[task_id] = (
                 False,
                 f"Object '{armature_name}' is not a valid armature.",
@@ -868,134 +1030,62 @@ def execute_get_bone_rest(task_id, armature_name):
         world_transform = back_trans @ ao.matrix_world
 
         bone_poses = {}
-
-        original_mode = ao.mode
-        bpy.context.view_layer.objects.active = ao
-        if ao.mode != "POSE":
-            bpy.ops.object.mode_set(mode="POSE")
-
-        # Save current bone poses before clearing them
-        for bone in ao.pose.bones:
-            saved_bone_matrices[bone.name] = bone.matrix_basis.copy()
-
-        # Clear transforms to guarantee we are calculating from the rest pose.
-        # This is crucial for ensuring that pose_bone.matrix reflects the actual
-        # rest pose of the armature.
-        bpy.ops.pose.select_all(action="SELECT")
-        bpy.ops.pose.transforms_clear()
-        bpy.ops.pose.select_all(action="DESELECT")
-
-        # Cache for rest transforms to avoid re-calculating for parents
         rest_transform_cache = {}
 
-        # Iterate through bones sorted by hierarchy to ensure parents are processed before their children.
-        # This is essential for correctly calculating parent-relative transforms.
-        sorted_bones = sorted(ao.pose.bones, key=lambda b: len(b.parent_recursive))
+        # Parents before children so parent-relative transforms can be built.
+        sorted_bones = sorted(ao.data.bones, key=lambda b: len(b.parent_recursive))
 
-        for pose_bone in sorted_bones:
-            is_imported_deform_bone = bool(pose_bone.bone.get("rbx_is_deform_bone", False))
+        def components(matrix):
+            translation = matrix.to_translation()
+            return [
+                translation.x, translation.y, translation.z,
+                matrix[0][0], matrix[0][1], matrix[0][2],
+                matrix[1][0], matrix[1][1], matrix[1][2],
+                matrix[2][0], matrix[2][1], matrix[2][2],
+            ]
+
+        for bone in sorted_bones:
+            is_imported_deform_bone = bool(bone.get("rbx_is_deform_bone", False))
             has_motor6d_props = (not is_imported_deform_bone) and (
-                "transform" in pose_bone.bone
-                and "transform1" in pose_bone.bone
-                and "nicetransform" in pose_bone.bone
+                "transform" in bone
+                and "transform1" in bone
+                and "nicetransform" in bone
             )
 
             if has_motor6d_props:
                 # Keep sync-bones aligned with the Motor6D serializer by rebuilding
                 # the rest joint frame from the stored Roblox-space transforms.
-                orig_mat = Matrix(pose_bone.bone["transform"])
-                orig_mat_tr1 = Matrix(pose_bone.bone["transform1"])
+                orig_mat = Matrix(bone["transform"])
+                orig_mat_tr1 = Matrix(bone["transform1"])
                 rest_obj_transform = back_trans @ (orig_mat @ orig_mat_tr1)
             else:
                 # New/deform bones don't have stored Motor6D metadata, so derive the
                 # rest frame from the actual Blender rest pose in object space.
-                rest_obj_transform = world_transform @ pose_bone.bone.matrix_local
+                rest_obj_transform = world_transform @ bone.matrix_local
 
-            rest_transform_cache[pose_bone.name] = rest_obj_transform
+            rest_transform_cache[bone.name] = rest_obj_transform
 
-            # Calculate the bone's rest transform relative to its parent.
-            reported_parent_name = _get_reported_bone_parent_name(pose_bone)
+            reported_parent_name = _get_reported_bone_parent_name(bone)
+            rest_local_transform = rest_obj_transform
             if reported_parent_name:
                 parent_rest_transform = rest_transform_cache.get(reported_parent_name)
-                if parent_rest_transform:
+                if parent_rest_transform is not None:
                     try:
-                        # The relative transform is the transformation from the parent's space to the child's space.
-                        rest_local_transform = (
-                            parent_rest_transform.inverted() @ rest_obj_transform
-                        )
+                        rest_local_transform = parent_rest_transform.inverted() @ rest_obj_transform
                     except ValueError:
-                        # Fallback for non-invertible parent matrix, though this is rare.
                         rest_local_transform = rest_obj_transform
-                else:
-                    # This case should not be hit with presorted bones, but serves as a safe fallback.
-                    rest_local_transform = rest_obj_transform
-            else:
-                # For root bones, the local transform is the same as its object-space transform.
-                rest_local_transform = rest_obj_transform
 
-            world_matrix = rest_obj_transform
-            relative_matrix = rest_local_transform
-
-            # Convert matrices to Roblox CFrame-compatible components.
-            world_translation = world_matrix.to_translation()
-            world_components = [
-                world_translation.x,
-                world_translation.y,
-                world_translation.z,
-                world_matrix[0][0],
-                world_matrix[0][1],
-                world_matrix[0][2],
-                world_matrix[1][0],
-                world_matrix[1][1],
-                world_matrix[1][2],
-                world_matrix[2][0],
-                world_matrix[2][1],
-                world_matrix[2][2],
-            ]
-
-            relative_translation = relative_matrix.to_translation()
-            relative_components = [
-                relative_translation.x,
-                relative_translation.y,
-                relative_translation.z,
-                relative_matrix[0][0],
-                relative_matrix[0][1],
-                relative_matrix[0][2],
-                relative_matrix[1][0],
-                relative_matrix[1][1],
-                relative_matrix[1][2],
-                relative_matrix[2][0],
-                relative_matrix[2][1],
-                relative_matrix[2][2],
-            ]
-
-            is_synthetic = pose_bone.bone.get("is_synthetic_helper", False)
-            bone_poses[pose_bone.name] = {
-                "world": world_components,
-                "relative": relative_components,
+            bone_poses[bone.name] = {
+                "world": components(rest_obj_transform),
+                "relative": components(rest_local_transform),
                 "parent": reported_parent_name,
-                "is_synthetic_helper": is_synthetic,
+                "is_synthetic_helper": bone.get("is_synthetic_helper", False),
+                "source_name": bone.get("rbx_source_name", bone.name),
             }
 
-        # Restore original mode
-        if ao.mode != original_mode:
-            bpy.ops.object.mode_set(mode=original_mode)
-
         response = {"armature": armature_name, "bone_poses": bone_poses}
-
-        data = json.dumps(response).encode("utf-8")
-        pending_responses[task_id] = (True, data)
+        pending_responses[task_id] = (True, json.dumps(response).encode("utf-8"))
 
     except Exception as e:
         traceback.print_exc()
         pending_responses[task_id] = (False, f"Error getting bone rest poses: {str(e)}")
-    finally:
-        # Restore original bone poses
-        if ao and saved_bone_matrices:
-            for bone in ao.pose.bones:
-                if bone.name in saved_bone_matrices:
-                    bone.matrix_basis = saved_bone_matrices[bone.name]
-
-        # Ensure mode is restored even if an error occurs
-        if original_mode and ao and ao.mode != original_mode:
-            bpy.ops.object.mode_set(mode=original_mode)

@@ -350,7 +350,11 @@ function PlayerTab.create(services: any)
 					end,
 				}),
 				Button({
-					Text = "Upload Animation to Roblox",
+					Text = Computed(function()
+						-- Say when Mirror/Speed/Resample/Simplify/Scale will change what's saved.
+						local count = #services.animationManager.activeModifierNames()
+						return if count > 0 then string.format("Upload Animation to Roblox (%d modifier%s on)", count, if count == 1 then "" else "s") else "Upload Animation to Roblox"
+					end),
 					Size = UDim2.new(1, 0, 0, 30),
 					Enabled = Computed(function()
 						return State.activeRigExists:get()
@@ -369,7 +373,11 @@ function PlayerTab.create(services: any)
 				}) :: any,
 				Button({
 					LayoutOrder = 6,
-					Text = "Save Animation to Rig",
+					Text = Computed(function()
+						-- Say when Mirror/Speed/Resample/Simplify/Scale will change what's saved.
+						local count = #services.animationManager.activeModifierNames()
+						return if count > 0 then string.format("Save Animation to Rig (%d modifier%s on)", count, if count == 1 then "" else "s") else "Save Animation to Rig"
+					end),
 					Size = UDim2.new(1, 0, 0, 30),
 					Enabled = Computed(function()
 						return State.activeRigExists:get()

@@ -204,7 +204,8 @@ class TestAnimationSerialization(unittest.TestCase):
         requests.execute_import_animation(task_id, animation_data, armature_obj.name)
         success, error = requests.pending_responses.pop(task_id)
         self.assertTrue(success, error)
-        bpy.context.scene.frame_set(1)
+        # Import places animation time 0 on the scene's start frame.
+        bpy.context.scene.frame_set(bpy.context.scene.frame_start + 1)
         actual = armature_obj.pose.bones["Bone"].matrix_basis
 
         for row in range(4):

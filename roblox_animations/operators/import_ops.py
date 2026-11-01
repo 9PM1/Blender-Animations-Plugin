@@ -5866,7 +5866,13 @@ def _sample_sequence(seq, t, default):
 
 
 def _create_rbx_decals(collection, part_entries):
-    """Create projected planes for supported Roblox Decal instances."""
+    """Create projected planes for supported Roblox Decal instances.
+
+    ``collection`` is a collection, or a callable mapping a part entry to the
+    collection its part was built in. Each decal records its part's referent
+    so it binds to the same bone.
+    """
+    collection_for = collection if callable(collection) else (lambda _entry: collection)
     from ..rig.textures import fetch_texture_image, _color_image_view
 
     # Roblox NormalId enum: Right, Top, Back, Left, Bottom, Front.
@@ -5890,10 +5896,12 @@ def _create_rbx_decals(collection, part_entries):
         # face_decal and composite it through the clothing path.  Dynamic
         # heads never get face_decal, so their Decal instances must still
         # build as projected planes here.
+        face_index = None
         if entry.get("name") == "Head" and entry.get("face_decal"):
-            continue
+            # Only the face decal rides the clothing bake; others stay decals.
+            face_index = int(entry.get("face_decal_index", 0) or 0)
         for index, decal in enumerate(entry.get("decals") or ()):
-            if not isinstance(decal, dict):
+            if not isinstance(decal, dict) or index == face_index:
                 continue
             face = faces.get(int(decal.get("face", 5)))
             texture_ref = decal.get("texture")
@@ -5987,8 +5995,15 @@ def _create_rbx_decals(collection, part_entries):
                 pass
             obj = bpy.data.objects.new(f"{entry.get('name', 'Part')}_Decal.{index:03d}", mesh)
             mesh.materials.append(material)
-            collection.objects.link(obj)
+            target_collection = collection_for(entry)
+            if target_collection is None:
+                target_collection = bpy.context.scene.collection
+            target_collection.objects.link(obj)
             obj["RBXDecal"] = True
+            try:
+                obj["RBXInstRef"] = int(entry.get("inst_ref", -1))
+            except (TypeError, ValueError):
+                pass
             created += 1
     return created
 
@@ -6459,20 +6474,76 @@ def _hydrate_rbxl_beam_images(deferred_image_materials):
     return hydrated
 
 
-def _require_rbxm_login(operator):
-    """Validate or refresh the login before the importer can change the scene."""
+def _rbxm_login_note():
+    """Why Roblox-hosted assets can't be downloaded right now, or None.
+
+    Importing doesn't require a login: bundled R6 meshes, primitives and
+    unions need no network. Assets that do get a placeholder and appear in
+    the import report with this reason.
+    """
     from ..core import auth
 
     if not auth.is_online_access_allowed():
-        message = "Enable Online Access in Blender Preferences, then log in under Roblox Account before importing."
-    elif auth.is_login_in_progress():
-        message = "Finish logging in to Roblox before importing the model or place."
-    elif not auth.get_auth_headers().get("Authorization"):
-        message = "Roblox login is required. Click Log In to Roblox under Roblox Account, then import again."
-    else:
-        return True
-    operator.report({"ERROR"}, message)
-    return False
+        return "Online Access is off in Blender Preferences, so Roblox-hosted meshes and textures weren't downloaded."
+    if auth.is_login_in_progress():
+        return "The Roblox login hadn't finished, so Roblox-hosted meshes and textures weren't downloaded."
+    if not auth.get_auth_headers().get("Authorization"):
+        return "Not logged in to Roblox (Roblox Account panel), so Roblox-hosted meshes and textures weren't downloaded."
+    return None
+
+
+def _require_rbxm_login(operator):
+    """Backward-compatible check: True when Roblox assets can be downloaded."""
+    note = _rbxm_login_note()
+    if note:
+        operator.report({"WARNING"}, note)
+        return False
+    return True
+
+
+def _is_remote_asset(asset_id) -> bool:
+    text = str(asset_id or "").strip().lower()
+    return bool(text) and not text.startswith("rbxasset://")
+
+
+def _remove_import_scaffold(meta_obj, collections):
+    """Delete what a failed import created so nothing half-built is left."""
+    try:
+        if meta_obj is not None and meta_obj.name in bpy.data.objects:
+            bpy.data.objects.remove(meta_obj, do_unlink=True)
+    except ReferenceError:
+        pass
+    for collection in collections:
+        try:
+            if collection is None or collection.name not in bpy.data.collections:
+                continue
+            for obj in list(collection.all_objects):
+                bpy.data.objects.remove(obj, do_unlink=True)
+            for child in list(collection.children_recursive):
+                bpy.data.collections.remove(child)
+            bpy.data.collections.remove(collection)
+        except ReferenceError:
+            continue
+
+
+def _unbound_rig_objects(collection_names):
+    """Mesh objects of an imported rig that follow no bone."""
+    loose = []
+    for collection_name in collection_names:
+        collection = bpy.data.collections.get(collection_name)
+        if collection is None:
+            continue
+        for obj in collection.all_objects:
+            if obj.type != "MESH" or obj.get("RBXHiddenPrimaryPart"):
+                continue
+            if any(c.type == "CHILD_OF" and c.target is not None for c in obj.constraints):
+                continue
+            if any(m.type == "ARMATURE" and m.object is not None for m in obj.modifiers):
+                continue
+            if obj.parent is not None and obj.parent.type == "ARMATURE":
+                continue
+            loose.append(obj.name)
+    return loose
 
 
 class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
@@ -6565,13 +6636,16 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
     directory: bpy.props.StringProperty(maxlen=1024, default="", options={"HIDDEN"})
 
     def invoke(self, context, event):
-        if not _require_rbxm_login(self):
-            return {"CANCELLED"}
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
     def draw(self, context):
         layout = self.layout
+        note = _rbxm_login_note()
+        if note:
+            box = layout.box()
+            box.label(text="Roblox downloads unavailable:", icon="INFO")
+            box.label(text="Hosted meshes import as placeholder boxes.")
         geometry = layout.box()
         geometry.label(text="Geometry", icon="MESH_DATA")
         geometry.prop(self, "mesh_lod")
@@ -6592,9 +6666,10 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
         import os
 
         # Recheck after the file browser: the user may have logged out or the
-        # saved session may have expired. Direct operator calls use this gate too.
-        if not _require_rbxm_login(self):
-            return {"CANCELLED"}
+        # saved session may have expired. Without a login the import still
+        # runs; hosted assets become placeholders listed in the report.
+        self._login_note = _rbxm_login_note()
+        self._problems = []
 
         def release_transient_import_memory():
             # These caches contain raw network payloads and parsed Python data,
@@ -6632,19 +6707,42 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
             else:
                 failures.append(os.path.basename(path))
 
+        problems = list(getattr(self, "_problems", []) or [])
+        try:
+            from ..rig import clothing as _clothing
+
+            problems.extend(_clothing.take_clothing_problems())
+        except Exception:
+            pass
+        if imported and problems and getattr(self, "_login_note", None):
+            problems.insert(0, self._login_note)
+
         if imported == 0:
             release_transient_import_memory()
             self.report({"ERROR"}, "No models imported. Check the .rbxm files contain parts/meshes.")
+            for problem in problems[:10]:
+                self.report({"WARNING"}, problem)
             return {"CANCELLED"}
+        release_transient_import_memory()
         if failures:
-            release_transient_import_memory()
             self.report(
                 {"WARNING"},
                 f"Imported {imported} model(s); skipped {len(failures)}: {', '.join(failures)}",
             )
+        elif problems:
+            self.report(
+                {"WARNING"},
+                f"Imported {imported} model(s) with {len(problems)} problem(s); see below.",
+            )
         else:
-            release_transient_import_memory()
             self.report({"INFO"}, f"Imported {imported} model(s).")
+        # Every problem is listed: nothing about the import is console-only.
+        for problem in problems[:25]:
+            self.report({"WARNING"}, problem)
+        if len(problems) > 25:
+            self.report({"WARNING"}, f"...and {len(problems) - 25} more (see the system console).")
+        for problem in problems:
+            print(f"[RbxmImport] problem: {problem}")
         return {"FINISHED"}
 
     def _import_one(self, context, filepath):
@@ -6982,6 +7080,11 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
             for ref in (shirt_template, pants_template, face_ref):
                 if ref:
                     texture_refs.append(ref)
+            for entry in part_aux:
+                for key in ("shirt_template", "pants_template", "face_texture"):
+                    ref = entry.get(key)
+                    if isinstance(ref, str) and ref and ref not in texture_refs:
+                        texture_refs.append(ref)
             if is_place:
                 from ..rig.terrain import smooth_grid_material_enums
 
@@ -7134,6 +7237,9 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
                     skipped.append(f"{part_name} (union build failed)")
                 continue
             mesh_id = entry.get("mesh_id")
+            if not mesh_id and entry.get("empty_special_mesh"):
+                skipped.append(f"{part_name} (empty SpecialMesh; invisible in Roblox too)")
+                continue
             if not mesh_id:
                 # Try primitive Part shape (Block/Cylinder/Sphere/Wedge/CornerWedge).
                 shape = entry.get("shape")
@@ -7158,11 +7264,34 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
                 lazy_mesh_jobs.append((entry, part_collection_for_entry(entry)))
                 built += 1
                 continue
-            try:
-                mesh_data = fetch_and_parse_filemesh(mesh_id, allow_local_paths=False)
-            except Exception as exc:
-                skipped.append(f"{part_name} ({exc})")
-                print(f"[RbxmImport] Failed to fetch FileMesh for '{part_name}': {exc}")
+            login_note = getattr(self, "_login_note", None)
+            mesh_data = None
+            if login_note and _is_remote_asset(mesh_id):
+                reason = "needs a Roblox login to download"
+            else:
+                try:
+                    mesh_data = fetch_and_parse_filemesh(mesh_id, allow_local_paths=False)
+                    reason = ""
+                except Exception as exc:
+                    reason = str(exc) or exc.__class__.__name__
+                    print(f"[RbxmImport] Failed to fetch FileMesh for '{part_name}': {exc}")
+            if mesh_data is None:
+                # A visible, correctly placed box instead of a missing part,
+                # so it still binds to its bone and shows what's missing.
+                from ..rig.creation import _create_pending_filemesh_proxy
+
+                placeholder = _create_pending_filemesh_proxy(
+                    part_collection_for_entry(entry), part_name, entry
+                )
+                if placeholder is not None:
+                    placeholder.pop("RBXPendingFileMesh", None)
+                    placeholder["RBXMissingMesh"] = reason
+                    built += 1
+                    built_objs.append(placeholder)
+                problems = getattr(self, "_problems", None)
+                if problems is not None:
+                    problems.append(f"'{part_name}' is a placeholder box: its mesh {reason}.")
+                skipped.append(f"{part_name} (placeholder: {reason})")
                 continue
             mesh_obj = create_sync_mesh(
                 part_collection_for_entry(entry), part_name, mesh_data, entry
@@ -7233,7 +7362,15 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
                 {"ERROR"},
                 f"'{rig_name}': could not load mesh geometry. {reason}",
             )
+            # Don't leave an empty rig scaffold behind.
+            _remove_import_scaffold(meta_obj, [master_collection])
             return "CANCELLED"
+        problems = getattr(self, "_problems", None)
+        if problems is not None:
+            for note in skipped:
+                if "placeholder:" in note or "hidden primary part" in note:
+                    continue
+                problems.append(f"Skipped {note}.")
 
         # --- Weapon attach prompt: the Studio plugin stamps grip metadata as
         # attributes on the exported weapon clone (weaponGrip entries), so an
@@ -7393,7 +7530,7 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
             return "FINISHED"
 
         if import_decals:
-            _create_rbx_decals(parts_collection, part_aux)
+            _create_rbx_decals(part_collection_for_entry, part_aux)
 
         # --- Generate armatures + bind, reusing the standard pipeline.
         # Every rig owns a scaffold built during collection setup; each gets
@@ -7413,6 +7550,17 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
                 create_rig("CONNECT", meta_obj.name)
         except Exception as exc:
             self.report({"WARNING"}, f"'{rig_name}': geometry imported, but rig generation failed: {exc}")
+
+        # Anything left following no bone stays behind when you animate: say so.
+        rig_collection_names = [master_collection.name]
+        loose = _unbound_rig_objects(rig_collection_names)
+        problems = getattr(self, "_problems", None)
+        if loose and problems is not None and (meta_loaded.get("rig") or rig_scaffolds):
+            shown = ", ".join(loose[:6]) + (f" (+{len(loose) - 6} more)" if len(loose) > 6 else "")
+            problems.append(
+                f"{len(loose)} object(s) aren't attached to any bone and won't move with the rig: {shown}. "
+                "Use Manual Part Constraints to attach them."
+            )
 
         print(f"[RbxmImport] Imported '{rig_name}' ({built} meshes built).")
         return "FINISHED"

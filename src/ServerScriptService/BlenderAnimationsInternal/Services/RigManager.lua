@@ -6,6 +6,8 @@ local State = require(script.Parent.Parent.state)
 local Types = require(script.Parent.Parent.types)
 
 local Rig = require(script.Parent.Parent.Components.Rig)
+local RigValidation = require(script.Parent.Parent.Components.RigValidation)
+local Undo = require(script.Parent.Parent.Components.Undo)
 
 local RigManager = {}
 RigManager.__index = RigManager
@@ -24,10 +26,7 @@ end
 
 -- Function to check if the selected object is a valid rig
 function RigManager:isValidRig(object: any): boolean
-	return typeof(object) == "Instance"
-		and object:IsA("Model")
-		and (object:FindFirstChildWhichIsA("Humanoid") or object:FindFirstChildWhichIsA("AnimationController"))
-			~= nil
+	return RigValidation.isValidRig(object)
 end
 
 function RigManager:isKeyframeSequence(object: any): boolean
@@ -83,8 +82,24 @@ end
 
 function RigManager:addWarning(newWarning)
 	local currentWarnings = State.activeWarnings:get()
-	table.insert(currentWarnings, newWarning)
-	State.activeWarnings:set(currentWarnings)
+	-- The same problem reported twice (a retried import, a repeated keystroke)
+	-- used to stack up in the list.
+	if table.find(currentWarnings, newWarning) then
+		return
+	end
+	local updated = table.clone(currentWarnings)
+	table.insert(updated, newWarning)
+	State.activeWarnings:set(updated)
+end
+
+function RigManager:removeWarning(oldWarning)
+	local currentWarnings = State.activeWarnings:get()
+	local index = table.find(currentWarnings, oldWarning)
+	if index then
+		local updated = table.clone(currentWarnings)
+		table.remove(updated, index)
+		State.activeWarnings:set(updated)
+	end
 end
 
 function RigManager:clearWarnings()
@@ -335,10 +350,10 @@ end
 
 -- Main rig setting function
 function RigManager:setRig(rigModel: Types.RigModelType?): any
-	if State.lastSelectionWasKeyframeSequence then
-		State.lastSelectionWasKeyframeSequence = false
-		return
-	end
+	-- Each call gets a token; a slower, older call must not overwrite the rig
+	-- the user selected after it (rapid clicking between rigs).
+	self._setRigToken = (self._setRigToken or 0) + 1
+	local token = self._setRigToken
 
 	State.loadingEnabled:set(true)
 	self:clearWarnings()
@@ -390,10 +405,14 @@ function RigManager:setRig(rigModel: Types.RigModelType?): any
 	end
 
 	if not rigModel.PrimaryPart then
-		self:addWarning("Rig has no PrimaryPart set.")
-		if rigModel:FindFirstChild("HumanoidRootPart") then
-			rigModel.PrimaryPart = rigModel:FindFirstChild("HumanoidRootPart") :: BasePart
+		local rootPart = rigModel:FindFirstChild("HumanoidRootPart")
+		if rootPart and rootPart:IsA("BasePart") then
+			Undo.record("Set rig PrimaryPart", function()
+				rigModel.PrimaryPart = rootPart :: BasePart
+			end)
+			self:addWarning("Rig had no PrimaryPart; set it to HumanoidRootPart (Ctrl+Z undoes this).")
 		else
+			self:addWarning("Rig has no PrimaryPart. Set Model.PrimaryPart to its root part (usually HumanoidRootPart).")
 			State.loadingEnabled:set(false)
 			return
 		end
@@ -414,16 +433,11 @@ function RigManager:setRig(rigModel: Types.RigModelType?): any
 		return
 	end
 
-	-- Check model size to prevent performance issues
-	local descendantCount = 0
-	for _, descendant in pairs(rigModel:GetDescendants()) do
-		if descendant:IsA("Part") then
-			descendantCount = descendantCount + 1
-			if descendantCount > 5000 then -- Prevent performance issues with huge models
-				self:addWarning("Model has too many parts (" .. descendantCount .. "). This may cause performance issues.")
-				break
-			end
-		end
+	-- Check model size to prevent performance issues (every BasePart counts,
+	-- MeshParts included).
+	local partCount = RigValidation.countBaseParts(rigModel, 5000)
+	if partCount > 5000 then
+		self:addWarning("Model has more than 5000 parts. This may cause performance issues.")
 	end
 
 	-- Use extracted warning function
@@ -437,9 +451,9 @@ function RigManager:setRig(rigModel: Types.RigModelType?): any
 	-- Use the old pattern: Rig.new(rigModel :: any) :: any
 	local success, result = pcall(function()
 		-- Add timeout protection for rig creation
-		local startTime = tick()
+		local startTime = os.clock()
 		local rig = Rig.new(rigModel :: any) :: any
-		local elapsed = tick() - startTime
+		local elapsed = os.clock() - startTime
 		
 		if elapsed > 5 then -- Warn if rig creation takes too long
 			warn("Rig creation took " .. elapsed .. " seconds. This may indicate performance issues.")
@@ -448,8 +462,16 @@ function RigManager:setRig(rigModel: Types.RigModelType?): any
 		return rig
 	end)
 	
+		if token ~= self._setRigToken or State.activeRigModel ~= rigModel then
+			-- The user selected another rig while this one was building.
+			return
+		end
+
 		if success then
 			State.activeRig = result
+			for _, problem in ipairs(RigValidation.describeJointProblems(rigModel :: any, result)) do
+				self:addWarning(problem)
+			end
 		else
 			-- Check if it's a circular dependency warning
 			if string.find(tostring(result), "CIRCULAR MOTOR6D CHAIN DETECTED") then
@@ -498,6 +520,13 @@ end
 -- If the active rig is Motor6D-based, creates a placeholder Part and a Motor6D under the resolved parent part.
 -- If it's a deform-bone rig, creates a Bone under the most appropriate mesh/bone parent.
 function RigManager:syncBones(blenderSyncManager: any?): boolean
+	-- Creating bones, parts and Motor6Ds is one undo step.
+	return Undo.record("Sync bones from Blender", function()
+		return self:_syncBonesImpl(blenderSyncManager)
+	end)
+end
+
+function RigManager:_syncBonesImpl(blenderSyncManager: any?): boolean
     if not State.activeRigModel or not State.activeRig then
         print("Sync Bones: No active rig to sync")
         return false

@@ -28,6 +28,23 @@ from .scale import (
 )
 
 
+# Per-export problems that must reach the user, not just the console.
+_EXPORT_ERRORS: list = []
+
+
+def reset_export_errors() -> None:
+    _EXPORT_ERRORS.clear()
+
+
+def record_export_error(message: str) -> None:
+    if message not in _EXPORT_ERRORS and len(_EXPORT_ERRORS) < 50:
+        _EXPORT_ERRORS.append(message)
+
+
+def export_errors() -> list:
+    return list(_EXPORT_ERRORS)
+
+
 # Shared only for the duration of one export. Store names, never evaluated
 # pose-bone references: Blender may replace evaluated data after frame_set.
 _SAMPLING_LAYOUT = object()
@@ -224,6 +241,7 @@ def serialize_animation_state(
                     state[bone.name] = statel
             except Exception as e:
                 print(f"[Export] Skipping bone '{bone.name}' due to serialization error: {e}")
+                record_export_error(f"{bone.name}: {e}")
 
     return state
 

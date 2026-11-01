@@ -6,6 +6,7 @@ local State = require(script.Parent.Parent.state)
 local Types = require(script.Parent.Parent.types)
 
 local BaseXX = require(script.Parent.Parent.Components.BaseXX)
+local Undo = require(script.Parent.Parent.Components.Undo)
 
 local ExportManager = {}
 ExportManager.__index = ExportManager
@@ -62,11 +63,83 @@ local function modelHasSkinnedAccessories(root: Instance?): boolean
 	return false
 end
 
+-- Legacy OBJ export only. Studio's ExportSelection captures the skinned
+-- accessory meshes as currently deformed, and the skinning of freshly cloned
+-- accessories isn't applied until a few frames later; there is no event for
+-- "skinning applied", so the OBJ path waits a fixed time. The .rbxm export
+-- reads the instances directly and never needs this.
 local function waitBeforeExportSelectionIfNeeded(root: Instance?)
 	if modelHasSkinnedAccessories(root) then
 		task.wait(1.5)
 	end
 end
+
+-- Move an export clone so its PrimaryPart sits at the world origin (X/Z),
+-- keeping its height and rotation. The user's rig in the place is never moved.
+local function moveCloneToOrigin(model: Model)
+	local primary = model.PrimaryPart
+	if not primary then
+		return
+	end
+	local current = primary.CFrame
+	-- Rotation is kept exactly; CFrame.Angles(current:ToOrientation()) mixed
+	-- up the rotation order and tilted rigs that were turned on several axes.
+	local target = CFrame.new(0, current.Position.Y, 0) * current.Rotation
+	model:PivotTo(target * current:Inverse() * model:GetPivot())
+end
+
+local function cloneForExport(model: Model): Model?
+	local wasArchivable = model.Archivable
+	model.Archivable = true
+	local clone = model:Clone()
+	model.Archivable = wasArchivable
+	return clone
+end
+
+-- Legacy OBJ exports leave a clone and meta parts in Workspace for the save
+-- dialog. Remove them on the user's next selection change (connected after a
+-- moment, so the export's own Selection:Set can't trigger it early).
+local function cleanUpAfterNextSelection(manager: any)
+	task.delay(1, function()
+		local connection: RBXScriptConnection? = nil
+		connection = game.Selection.SelectionChanged:Connect(function()
+			if connection then
+				connection:Disconnect()
+			end
+			manager:clearMetaParts()
+		end)
+	end)
+end
+
+-- The joint that connects a weapon to the rig, whichever way round it is.
+-- Returns (joint, rigPart, weaponPart) or nil.
+local function findGripJoint(searchRoots: { Instance }, weaponPartSet: { [Instance]: boolean }, rigModel: Instance)
+	local seen: { [Instance]: boolean } = {}
+	for _, root in ipairs(searchRoots) do
+		for _, desc in ipairs(root:GetDescendants()) do
+			if seen[desc] then
+				continue
+			end
+			if desc:IsA("Motor6D") or desc:IsA("Weld") or desc:IsA("WeldConstraint") then
+				seen[desc] = true
+				local j = desc :: any
+				local p0, p1 = j.Part0, j.Part1
+				if not p0 or not p1 then
+					continue
+				end
+				if weaponPartSet[p0] and p1:IsDescendantOf(rigModel) and not weaponPartSet[p1] then
+					return desc, p1 :: BasePart, p0 :: BasePart
+				elseif weaponPartSet[p1] and p0:IsDescendantOf(rigModel) and not weaponPartSet[p0] then
+					return desc, p0 :: BasePart, p1 :: BasePart
+				end
+			end
+		end
+	end
+	return nil
+end
+
+ExportManager.findGripJoint = findGripJoint
+ExportManager._moveCloneToOrigin = moveCloneToOrigin
 
 local function focusCurrentCameraOnRigPrimaryPart()
 	local activeRigModel = State.activeRigModel
@@ -564,27 +637,39 @@ function ExportManager:exportRigRbxm()
 		return
 	end
 
-	if State.setRigOrigin:get(true) then
-		local primaryPart = rigModel.PrimaryPart :: BasePart?
-		if primaryPart then
-			local currentCFrame = primaryPart.CFrame
-			primaryPart.CFrame = CFrame.new(0, currentCFrame.Position.Y, 0) * CFrame.Angles(currentCFrame:ToOrientation())
-			task.wait()
-		end
-	end
-
-	focusCurrentCameraOnRigPrimaryPart()
-	game.Selection:Set({ rigModel })
-
 	local pluginRef = self._plugin
 	if not pluginRef then
 		warn("[ExportManager] RBXM export unavailable: no plugin reference.")
 		return
 	end
 
+	-- "Set rig origin" exports a moved clone; the rig in the place stays put.
+	local exportModel: Model = rigModel
+	local clone: Model? = nil
+	if State.setRigOrigin:get(true) and rigModel.PrimaryPart then
+		clone = cloneForExport(rigModel)
+		if clone then
+			clone.Parent = rigModel.Parent
+			moveCloneToOrigin(clone)
+			exportModel = clone
+		end
+	end
+
+	focusCurrentCameraOnRigPrimaryPart()
+	local previousSelection = game.Selection:Get()
+	local wasLocked = State.isSelectionLocked:get()
+	-- Selecting the clone must not start a new rig session.
+	State.isSelectionLocked:set(true)
+	game.Selection:Set({ exportModel })
+
 	local ok, saved = pcall(function()
 		return pluginRef:PromptSaveSelectionAsync(rigModel.Name)
 	end)
+	if clone then
+		clone:Destroy()
+	end
+	game.Selection:Set(previousSelection)
+	State.isSelectionLocked:set(wasLocked)
 	if not ok then
 		warn(('[ExportManager] RBXM export failed: %s'):format(tostring(saved)))
 	elseif saved then
@@ -596,15 +681,6 @@ function ExportManager:exportRig()
 	assert(State.activeRigModel, "activeRig is nil or false")
 
 	self:clearMetaParts()
-
-	---- Clone the rig model, then rename all baseparts to the rig name (let the export flow handle unique indices)
-	--print(activeRig)
-	if State.setRigOrigin:get(true) then
-		local currentCFrame = (State.activeRigModel.PrimaryPart :: BasePart).CFrame
-		local newCFrame = CFrame.new(0, currentCFrame.Position.Y, 0) * CFrame.Angles(currentCFrame:ToOrientation());
-		(State.activeRigModel.PrimaryPart :: BasePart).CFrame = newCFrame
-		task.wait()
-	end
 
 	local function buildArchivablePathMap(root: Instance)
 		local map = {}
@@ -650,6 +726,11 @@ function ExportManager:exportRig()
 
 	rigModelToExport.Parent = State.activeRigModel.Parent
 	rigModelToExport.Archivable = false
+	if State.setRigOrigin:get(true) then
+		-- Move the export clone, never the user's rig.
+		moveCloneToOrigin(rigModelToExport)
+		task.wait()
+	end
 
 	focusCurrentCameraOnRigPrimaryPart()
 
@@ -680,6 +761,7 @@ function ExportManager:exportRig()
 	game.Selection:Set(State.metaParts)
 	waitBeforeExportSelectionIfNeeded(rigModelToExport)
 	PluginManager():ExportSelection() -- deprecated
+	cleanUpAfterNextSelection(self)
 end
 
 -- Resolve weapon container + root from an Instance (Tool/Model/Accoutrement/BasePart).
@@ -729,7 +811,7 @@ function ExportManager:resolveWeapon(inst: Instance): (Instance?, BasePart?)
 					if weaponPartSet[p1] and p0:IsDescendantOf(rigModel) and not weaponPartSet[p0] then
 						weaponRoot = p1 :: BasePart
 						break
-					elseif weaponPartSet[p0] and p1:IsDescendantOf(rigModel) and not weaponPartSet[p0] then
+					elseif weaponPartSet[p0] and p1:IsDescendantOf(rigModel) and not weaponPartSet[p1] then
 						weaponRoot = p0 :: BasePart
 						break
 					end
@@ -745,7 +827,7 @@ function ExportManager:resolveWeapon(inst: Instance): (Instance?, BasePart?)
 						if weaponPartSet[p1] and p0:IsDescendantOf(rigModel) and not weaponPartSet[p0] then
 							weaponRoot = p1 :: BasePart
 							break
-						elseif weaponPartSet[p0] and p1:IsDescendantOf(rigModel) and not weaponPartSet[p0] then
+						elseif weaponPartSet[p0] and p1:IsDescendantOf(rigModel) and not weaponPartSet[p1] then
 							weaponRoot = p0 :: BasePart
 							break
 						end
@@ -816,6 +898,50 @@ function ExportManager:pickWeapon()
 	self:detectWeaponConnection()
 end
 
+local HAND_PART_NAMES = { "RightHand", "Right Arm", "LeftHand", "Left Arm" }
+
+-- Give the slotted weapon a Motor6D from the rig's hand, keeping it exactly
+-- where it is, so it can be animated without equipping it as a Tool. The game
+-- must create the same Motor6D (same Part0/Part1 names) when it equips it.
+function ExportManager:connectWeaponToHand(): boolean
+	local weapon = State.selectedWeapon:get()
+	local rigModel = State.activeRigModel or State.lastKnownRigModel
+	if not weapon or not rigModel then
+		warn("[ExportManager] Pick a rig and a weapon first.")
+		return false
+	end
+	local _container, root = self:resolveWeapon(weapon)
+	if not root then
+		warn("[ExportManager] The weapon has no parts.")
+		return false
+	end
+	local hand: BasePart? = nil
+	for _, name in ipairs(HAND_PART_NAMES) do
+		local candidate = rigModel:FindFirstChild(name, true)
+		if candidate and candidate:IsA("BasePart") and not candidate:IsDescendantOf(weapon) then
+			hand = candidate
+			break
+		end
+	end
+	if not hand then
+		warn("[ExportManager] The rig has no RightHand/Right Arm to connect to.")
+		return false
+	end
+	local handPart = hand :: BasePart
+	Undo.record("Connect weapon to hand", function()
+		local motor = Instance.new("Motor6D")
+		motor.Name = root.Name .. "Grip"
+		motor.Part0 = handPart
+		motor.Part1 = root
+		motor.C0 = handPart.CFrame:ToObjectSpace(root.CFrame)
+		motor.C1 = CFrame.identity
+		motor.Parent = handPart
+	end)
+	print(("[ExportManager] Connected '%s' to '%s' with Motor6D '%sGrip'. Create the same Motor6D in your game when the weapon is equipped."):format(root.Name, handPart.Name, root.Name))
+	self:detectWeaponConnection()
+	return true
+end
+
 -- Clear the slotted weapon.
 function ExportManager:clearWeapon()
 	State.selectedWeapon:set(nil)
@@ -864,31 +990,34 @@ function ExportManager:detectWeaponConnection()
 		table.insert(searchRoots, root)
 	end
 
-	local seen: { [Instance]: boolean } = {}
-	for _, sr in ipairs(searchRoots) do
-		for _, desc in ipairs(sr:GetDescendants()) do
-			if seen[desc] then continue end
-			if desc:IsA("Motor6D") or desc:IsA("Weld") or desc:IsA("WeldConstraint") then
-				seen[desc] = true
-				local j = desc :: any
-				local p0, p1 = j.Part0, j.Part1
-				if not p0 or not p1 then continue end
-				if weaponPartSet[p0] and p1:IsDescendantOf(rigModel) and not weaponPartSet[p1] then
-					State.weaponConnectionStatus:set(
-						("✓ %s: %s → %s"):format(desc.ClassName, p1.Name, p0.Name)
+	local joint, rigPart, weaponPart = findGripJoint(searchRoots, weaponPartSet, rigModel)
+	if joint and rigPart and weaponPart then
+		if joint:IsA("Motor6D") then
+			if (joint :: Motor6D).Part0 == weaponPart then
+				State.weaponConnectionStatus:set(
+					("⚠ Motor6D '%s' is reversed (%s → %s): make the body part Part0 so it can animate"):format(
+						joint.Name,
+						weaponPart.Name,
+						rigPart.Name
 					)
-					return
-				elseif weaponPartSet[p1] and p0:IsDescendantOf(rigModel) and not weaponPartSet[p0] then
-					State.weaponConnectionStatus:set(
-						("✓ %s: %s → %s"):format(desc.ClassName, p0.Name, p1.Name)
-					)
-					return
-				end
+				)
+			else
+				State.weaponConnectionStatus:set(("✓ Motor6D: %s → %s"):format(rigPart.Name, weaponPart.Name))
 			end
+		else
+			-- Welds hold the weapon but animations can't move it.
+			State.weaponConnectionStatus:set(
+				("⚠ %s: %s → %s holds it but can't be animated; use 'Connect to Hand' for a Motor6D"):format(
+					joint.ClassName,
+					rigPart.Name,
+					weaponPart.Name
+				)
+			)
 		end
+		return
 	end
 
-	State.weaponConnectionStatus:set("⚠ No connection — equip weapon on character")
+	State.weaponConnectionStatus:set("⚠ Not connected: equip it, or press 'Connect to Hand' to add a Motor6D")
 end
 
 function ExportManager:exportWeapon()
@@ -1334,6 +1463,7 @@ function ExportManager:exportWeapon()
 		:format(gripData.weaponName, partCount, hasMotor6Ds and "with" or "no", attachmentCount))
 	waitBeforeExportSelectionIfNeeded(weaponClone)
 	PluginManager():ExportSelection()
+	cleanUpAfterNextSelection(self)
 end
 
 -- Find joints connecting weapon parts to the active rig. Returns
@@ -1523,13 +1653,6 @@ function ExportManager:exportRigLegacy()
 
 	-- Clone the rig model, then rename all baseparts to the rig name (let the export flow handle unique indices)
 	--print(activeRig)
-	if State.setRigOrigin:get(true) then
-		local currentCFrame = (State.activeRigModel.PrimaryPart :: BasePart).CFrame
-		local newCFrame = CFrame.new(0, currentCFrame.Position.Y, 0) * CFrame.Angles(currentCFrame:ToOrientation());
-		(State.activeRigModel.PrimaryPart :: BasePart).CFrame = newCFrame
-		-- Yield so physics propagates CFrame to welded descendants before cloning
-		task.wait()
-	end
 
 	local function buildArchivablePathMap(root: Instance)
 		local map = {}
@@ -1574,6 +1697,11 @@ function ExportManager:exportRigLegacy()
 	end
 
 	rigModelToExport.Parent = State.activeRigModel.Parent
+	if State.setRigOrigin:get(true) then
+		-- Move the export clone, never the user's rig.
+		moveCloneToOrigin(rigModelToExport)
+		task.wait()
+	end
 	rigModelToExport.Archivable = false
 
 	focusCurrentCameraOnRigPrimaryPart()
@@ -1605,6 +1733,7 @@ function ExportManager:exportRigLegacy()
 	game.Selection:Set(State.metaParts)
 	waitBeforeExportSelectionIfNeeded(rigModelToExport)
 	PluginManager():ExportSelection() -- deprecated
+	cleanUpAfterNextSelection(self)
 end
 
 return ExportManager

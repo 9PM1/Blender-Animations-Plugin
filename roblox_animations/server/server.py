@@ -1,25 +1,41 @@
 """
-HTTP server setup and management for live sync functionality.
+HTTP and WebSocket server management for live sync.
+
+Sockets are served on background threads; Blender data is only touched by the
+``_server_tick`` timer on the main thread, which runs queued jobs (see
+``dispatch``) and publishes live-sync notifications.
 """
 
+from __future__ import annotations
+
+import http.server
+import os
 import socket
-import socketserver
+import threading
 import time
 import traceback
-from typing import Optional
+from typing import List, Optional
 
 import bpy
 
+from . import dispatch
 from .handler import AnimationHandler
 from .websocket import LiveSyncWebSocketServer
 from .requests import execute_in_main_thread, pending_responses
 from ..core.utils import get_armature_timeline_hash
 
+# Live sync uses the next port for its WebSocket, so the HTTP port must leave room.
+MIN_PORT = 1024
+MAX_PORT = 65534
+
 # Global server state managed via Blender timers
 server_instance: Optional["SafeTCPServer"] = None
 server_should_run: bool = False
 server_port: Optional[int] = None
+last_start_error: str = ""
 _timer_registered: bool = False
+_extra_servers: List["SafeTCPServer"] = []
+_server_threads: List[threading.Thread] = []
 websocket_server: Optional[LiveSyncWebSocketServer] = None
 _last_websocket_publish: float = 0.0
 _dirty_armatures: dict[str, float] = {}
@@ -27,17 +43,20 @@ _processing_websocket_sync: bool = False
 
 
 def _live_sync_depsgraph_handler(_scene, depsgraph) -> None:
-    """Mark subscribed actions dirty without hashing them on every graph update."""
+    """Mark subscribed armatures dirty without hashing them on every graph update."""
     if websocket_server is None or _processing_websocket_sync:
         return
     subscribed = websocket_server.subscribed_armatures()
     if not subscribed:
         return
     try:
-        action_changed = any(isinstance(update.id, bpy.types.Action) for update in depsgraph.updates)
+        # Only Action edits trigger an immediate check. Armature object updates
+        # also fire on every frame of playback; NLA, driver and constraint
+        # edits are picked up by the 2-second check (the hash covers them).
+        changed = any(isinstance(update.id, bpy.types.Action) for update in depsgraph.updates)
     except Exception:
-        action_changed = True
-    if action_changed:
+        changed = True
+    if changed:
         dirty_at = time.monotonic()
         for armature in subscribed:
             _dirty_armatures[armature] = dirty_at
@@ -61,7 +80,7 @@ def _process_websocket_sync_requests() -> None:
         request_id = request.get("request_id", "")
         trigger_hash = request.get("trigger_hash", "")
         armature = request.get("armature", "")
-        task_id = f"ws:{request_id}:{time.time_ns()}"
+        task_id = dispatch.new_task_id("ws")
         try:
             _processing_websocket_sync = True
             execute_in_main_thread(
@@ -99,48 +118,57 @@ def is_server_running() -> bool:
     return get_server_status()
 
 
-class SafeTCPServer(socketserver.TCPServer):
-    """TCP server with keepalive settings suitable for polling."""
+class SafeTCPServer(http.server.ThreadingHTTPServer):
+    """Threaded HTTP server that owns its port exclusively.
 
-    allow_reuse_address = True
+    On Windows, SO_REUSEADDR lets a second process bind the same port and
+    steal connections (two Blenders both "listening" on 31337), so the
+    socket uses SO_EXCLUSIVEADDRUSE there instead.
+    """
 
-    def __init__(self, server_address, RequestHandlerClass):
-        self.address_family = socket.AF_INET
+    daemon_threads = True
+    allow_reuse_address = os.name != "nt"
+    request_queue_size = 16
+
+    def __init__(self, server_address, RequestHandlerClass, family=socket.AF_INET):
+        self.address_family = family
         super().__init__(server_address, RequestHandlerClass)
 
     def server_bind(self):
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        if hasattr(socket, "TCP_KEEPIDLE"):
-            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
-        if hasattr(socket, "TCP_KEEPINTVL"):
-            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 60)
-        if hasattr(socket, "TCP_KEEPCNT"):
-            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        if self.address_family == socket.AF_INET6 and hasattr(socket, "IPV6_V6ONLY"):
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
         super().server_bind()
 
 
+def _blend_file_label() -> str:
+    try:
+        return os.path.basename(bpy.data.filepath) or "(unsaved file)"
+    except Exception:
+        return ""
+
+
 def _server_tick() -> Optional[float]:
-    """Timer callback that services pending HTTP requests."""
-    global _timer_registered
+    """Timer callback: run queued requests and publish live-sync updates."""
+    global _timer_registered, _last_websocket_publish
 
     if not server_should_run or server_instance is None:
         _timer_registered = False
         return None
 
+    dispatch.note_tick(_blend_file_label())
     try:
-        # handle_request respects the timeout set on the server instance
-        server_instance.handle_request()
-    except socket.timeout:
-        pass
+        dispatch.drain()
     except Exception as exc:
-        if server_should_run:
-            print(f"Blender Addon: Error in server request loop: {exc}")
-            traceback.print_exc()
+        print(f"Blender Addon: Error running a sync request: {exc}")
+        traceback.print_exc()
 
-    _process_websocket_sync_requests()
+    try:
+        _process_websocket_sync_requests()
+    except Exception:
+        traceback.print_exc()
 
-    global _last_websocket_publish
     if websocket_server is not None:
         now = time.monotonic()
         for armature in websocket_server.drain_new_subscriptions():
@@ -157,6 +185,7 @@ def _server_tick() -> Optional[float]:
             _last_websocket_publish = now
             websocket_server.publish_updates(get_armature_timeline_hash)
 
+    dispatch.note_tick(_blend_file_label())
     # Re-run quickly so we remain responsive without blocking Blender
     return 0.01
 
@@ -211,84 +240,151 @@ def handle_blend_file_loaded(_dummy=None) -> None:
         ensure_server_timer_running()
 
 
+def validate_port(port) -> str:
+    """Return an error message for an unusable port, or '' when it's fine."""
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return "The port must be a number."
+    if port < MIN_PORT or port > MAX_PORT:
+        return (
+            f"Port {port} can't be used: pick {MIN_PORT}-{MAX_PORT}. "
+            "Live sync also uses the next port up."
+        )
+    return ""
+
+
+def _describe_bind_error(port: int, exc: BaseException) -> str:
+    errno = getattr(exc, "errno", None)
+    winerror = getattr(exc, "winerror", None)
+    if errno in (98, 48, 10048) or winerror in (10048, 10013):
+        try:
+            from ..core import auth  # noqa: PLC0415
+
+            if auth.is_login_in_progress():
+                return (
+                    f"Port {port} is held by the Roblox login that's waiting in your "
+                    "browser. Finish or cancel the login, then start the server."
+                )
+        except Exception:
+            pass
+        return (
+            f"Port {port} is already in use, probably by another Blender or app. "
+            "Close it or pick a different port (and use the same port in Studio)."
+        )
+    return f"Could not open port {port}: {exc}"
+
+
+def _start_thread(server: SafeTCPServer, name: str) -> None:
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.25},
+        name=name,
+        daemon=True,
+    )
+    server._rbx_serving = True
+    thread.start()
+    _server_threads.append(thread)
+
+
 def start_server(port: int = 31337) -> bool:
-    """Start the live sync server using Blender timers instead of threads."""
-    global server_instance, server_should_run, server_port, _timer_registered, websocket_server, _last_websocket_publish
+    """Start the live sync servers. On failure ``last_start_error`` says why."""
+    global server_instance, server_should_run, server_port, websocket_server
+    global _last_websocket_publish, last_start_error
+
+    # Check the port before touching a running server: a typo must not cut
+    # off a working connection.
+    last_start_error = validate_port(port)
+    if last_start_error:
+        print(f"Blender Addon: {last_start_error}")
+        return False
+    port = int(port)
 
     if server_instance is not None:
         stop_server()
 
     try:
         _dirty_armatures.clear()
+        dispatch.clear()
         server_instance = SafeTCPServer(("127.0.0.1", port), AnimationHandler)
-        server_instance.timeout = 0  # Non-blocking select inside handle_request
+        # Studio connects to "localhost", which may resolve to ::1 first.
+        if socket.has_ipv6:
+            try:
+                _extra_servers.append(
+                    SafeTCPServer(("::1", port), AnimationHandler, family=socket.AF_INET6)
+                )
+            except OSError:
+                pass
         websocket_server = LiveSyncWebSocketServer(port + 1)
         websocket_server.start()
         _register_live_sync_handler()
         _last_websocket_publish = 0.0
         server_should_run = True
         server_port = port
+        dispatch.note_tick(_blend_file_label())
+
+        _start_thread(server_instance, "rbx-sync-http")
+        for index, extra in enumerate(_extra_servers):
+            _start_thread(extra, f"rbx-sync-http-v6-{index}")
 
         ensure_server_timer_running()
 
         print(f"Blender Addon: Server started and listening on port {port}")
         return True
     except Exception as exc:
-        print(f"Blender Addon: Failed to start server: {exc}")
+        failing_port = port + 1 if server_instance is not None else port
+        last_start_error = _describe_bind_error(failing_port, exc)
+        print(f"Blender Addon: Failed to start server: {last_start_error}")
         traceback.print_exc()
-
-        if server_instance is not None:
-            try:
-                server_instance.server_close()
-            except Exception:
-                pass
-
-        if websocket_server is not None:
-            websocket_server.stop()
-            websocket_server = None
-        _unregister_live_sync_handler()
-
-        server_instance = None
+        _shutdown_sockets()
         server_should_run = False
         server_port = None
-
+        _unregister_live_sync_handler()
         _unregister_server_timer()
-
         return False
+
+
+def _shutdown_sockets() -> None:
+    global server_instance, websocket_server
+
+    servers = ([server_instance] if server_instance is not None else []) + list(_extra_servers)
+    for server in servers:
+        try:
+            # shutdown() waits for serve_forever to exit, so only call it on
+            # servers whose thread was actually started.
+            if getattr(server, "_rbx_serving", False):
+                server.shutdown()
+        except Exception:
+            pass
+        try:
+            server.server_close()
+        except Exception as exc:
+            print(f"Blender Addon: Error closing server socket: {exc}")
+    for thread in _server_threads:
+        thread.join(timeout=1.0)
+    _server_threads.clear()
+    _extra_servers.clear()
+    server_instance = None
+    if websocket_server is not None:
+        websocket_server.stop()
+        websocket_server = None
 
 
 def stop_server() -> None:
     """Stop the live sync server and clean up resources."""
-    global server_instance, server_should_run, server_port, _timer_registered, websocket_server
+    global server_should_run, server_port
 
-    if server_instance is None:
-        server_should_run = False
-        server_port = None
-        _unregister_live_sync_handler()
-        if websocket_server is not None:
-            websocket_server.stop()
-            websocket_server = None
-        _unregister_server_timer()
-        return
-
-    print("Blender Addon: Stop server called.")
+    was_running = server_instance is not None
+    if was_running:
+        print("Blender Addon: Stop server called.")
 
     server_should_run = False
     _dirty_armatures.clear()
     _unregister_live_sync_handler()
-    if websocket_server is not None:
-        websocket_server.stop()
-        websocket_server = None
-    try:
-        try:
-            server_instance.server_close()
-        except Exception as exc:
-            print(f"Blender Addon: Error closing server socket: {exc}")
-            traceback.print_exc()
-    finally:
-        server_instance = None
-        server_port = None
-
+    dispatch.clear()
+    _shutdown_sockets()
+    server_port = None
     _unregister_server_timer()
 
-    print("Blender Addon: Server shutdown complete.")
+    if was_running:
+        print("Blender Addon: Server shutdown complete.")

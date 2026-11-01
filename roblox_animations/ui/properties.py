@@ -201,10 +201,13 @@ class RobloxAnimationSettings(PropertyGroup):
 
     rbx_server_port: IntProperty(
         name="Server Port",
-        description="Port for the animation server",
+        description=(
+            "Port for the sync server. Live sync also uses the next port up, "
+            "and Studio must use the same port"
+        ),
         default=DEFAULT_SERVER_PORT,
         min=1024,
-        max=65535,
+        max=65534,
     )
 
     rbx_auto_deform_scale: BoolProperty(
