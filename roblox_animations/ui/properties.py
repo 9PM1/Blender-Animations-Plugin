@@ -299,6 +299,16 @@ class RobloxAnimationSettings(PropertyGroup):
         default=True,
     )
 
+    rbx_parent_switch_markers: BoolProperty(
+        name="ParentSwitch Markers",
+        description=(
+            "Export a ParentSwitch KeyframeMarker wherever a bone switches parent "
+            "(value 'Part → NewParent'), so game code can re-attach the Motor6D "
+            "instead of relying on the baked compensation"
+        ),
+        default=False,
+    )
+
     rbx_hide_weld_bones: BoolProperty(
         name="Hide Weld Bones",
         description="Hide weld bones in the viewport while keeping them in the rig",

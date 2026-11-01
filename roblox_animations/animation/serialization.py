@@ -35,6 +35,15 @@ from .face_controls import (
     property_group_control_state,
 )
 from .ir import KeyframePayload, PoseEntry, keyframes_equivalent, pose_entries_equivalent
+from .parent_switch import (
+    PARENT_SWITCH_MARKER,
+    follow_constraint,
+    is_follow_constraint,
+    mark_switch_holds,
+    original_parent_name,
+    rig_root,
+    switch_plan,
+)
 from .planning import (
     build_bake_plan,
     constant_dependency_frames,
@@ -314,6 +323,40 @@ def export_pose_markers(ao) -> List[Dict[str, Any]]:
     return markers
 
 
+def parent_switch_markers(ao) -> List[Dict[str, Any]]:
+    """A ParentSwitch KeyframeMarker wherever a bone changes parent.
+
+    The value reads "Sword → HumanoidRootPart": the part, then what it follows
+    from there on (its original parent, or the rig's root part while it's
+    free). Game code can re-attach the Motor6D on these instead of relying on
+    the baked compensation.
+    """
+    animation_data = getattr(ao, "animation_data", None)
+    action = getattr(animation_data, "action", None) if animation_data else None
+    if action is None:
+        return []
+    slot = get_animation_data_action_slot(animation_data, action=action)
+    scene = bpy.context.scene
+    fps = get_scene_fps()
+    markers = []
+    for pose_bone in ao.pose.bones:
+        constraint = follow_constraint(pose_bone)
+        parent = ao.data.bones.get(original_parent_name(pose_bone))
+        if constraint is None or parent is None:
+            continue
+        part = export_channel_name(pose_bone)
+        plan = switch_plan(constraint, action, slot, scene.frame_start, scene.frame_end)
+        for frame, follows in plan.events:
+            target = export_channel_name(parent if follows else rig_root(parent))
+            markers.append({
+                "name": PARENT_SWITCH_MARKER,
+                "value": f"{part} → {target}",
+                "type": "Event",
+                "time": (frame - scene.frame_start) / fps,
+            })
+    return markers
+
+
 _OBJECT_TRANSFORM_PATHS = frozenset({
     "location", "rotation_euler", "rotation_quaternion", "rotation_axis_angle",
     "scale", "delta_location", "delta_rotation_euler", "delta_rotation_quaternion",
@@ -444,7 +487,9 @@ def get_all_constrained_bones(armature_obj: "bpy.types.Object") -> Set[str]:
                 constrained_bones.add(current_bone.name)
 
     for bone in armature_obj.pose.bones:
-        if bone.constraints:
+        # A follow-parent constraint only stands in for the parent link; the
+        # export bakes its free ranges itself (see parent_switch).
+        if any(not is_follow_constraint(bone, constraint) for constraint in bone.constraints):
             constrained_bones.add(bone.name)
             for constraint in bone.constraints:
                 if constraint.type in {"IK", "SPLINE_IK"}:
@@ -654,6 +699,8 @@ class ExportAnalysis:
     visual_samples: Dict[float, Dict[str, List[float]]] = field(default_factory=dict)
     visual_keyframes: Set[float] = field(default_factory=set)
     visual_bones: Set[str] = field(default_factory=set)
+    # Parent-switching bones of the hybrid bake (parent_switch.SwitchPlan).
+    switch_plans: Dict[str, Any] = field(default_factory=dict)
 
 
 def _analyze_export(
@@ -784,6 +831,7 @@ def _analyze_export(
     has_constraint_target_action = any(
         getattr(getattr(constraint, "target", None), "animation_data", None)
         and getattr(constraint.target.animation_data, "action", None)
+        and not is_follow_constraint(bone, constraint)
         for bone in ao.pose.bones
         for constraint in bone.constraints
     )
@@ -936,6 +984,11 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
     # constrained path has easing-thinning logic that would skip them.
     non_inheriting_bones: Set[str] = set()
     worldspace_parent_map: Dict[str, str] = {}
+    # Parent-switching bones: baked like world-space bones, but only where
+    # they don't follow their parent. Elsewhere they keep their sparse keys.
+    switch_plans = {}
+    frame_start = ctx.scene.frame_start
+    frame_end = ctx.scene.frame_end
     for bone in ao.pose.bones:
         if not bone.bone.use_inherit_rotation:
             non_inheriting_bones.add(bone.name)
@@ -943,10 +996,17 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
             original_parent = bone.bone.get("worldspace_original_parent", "")
             if original_parent:
                 worldspace_parent_map[bone.name] = original_parent
-                # Its Roblox pose is relative to the original parent, which can
-                # move between this bone's own keys. Sample every frame so the
-                # bone holds its world placement in Studio too.
-                non_inheriting_bones.add(bone.name)
+                constraint = follow_constraint(bone)
+                if constraint is not None:
+                    switch_plans[bone.name] = switch_plan(
+                        constraint, action, analysis.action_slot, frame_start, frame_end
+                    )
+                else:
+                    # Its Roblox pose is relative to the original parent, which can
+                    # move between this bone's own keys. Sample every frame so the
+                    # bone holds its world placement in Studio too.
+                    non_inheriting_bones.add(bone.name)
+    analysis.switch_plans = switch_plans
     if analysis.is_skinned_rig:
         non_inheriting_bones = get_deform_descendant_bones(
             ao,
@@ -978,6 +1038,8 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
     # Also find bones driven by constrained targets and gather their actions.
     for bone in ao.pose.bones:
         for constraint in bone.constraints:
+            if is_follow_constraint(bone, constraint):
+                continue
             if (
                 hasattr(constraint, "target")
                 and constraint.target
@@ -993,11 +1055,12 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
                 )
 
     has_constraints_local = len(constrained_bones) > 0 or len(non_inheriting_bones) > 0
+    switch_frames = set()
+    for switch in switch_plans.values():
+        switch_frames.update(switch.dense, switch.resume)
 
     # 2. Stage the keyframe plan: which frames/bones to evaluate, and how
     # per-channel easing reduces to per-pose easing.
-    frame_start = ctx.scene.frame_start
-    frame_end = ctx.scene.frame_end
     stepped_dependency_frames = (
         constant_dependency_frames(ao, frame_start, frame_end) if has_constraints_local else None
     )
@@ -1008,10 +1071,16 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
         )
     keyframe_times.update(face_export_context.get("keyed_frames") or set())
 
+    # A follow value is not a transform channel: its constant keys must not
+    # turn into holds or keys of the bone's own motion.
+    follow_paths = set()
+    for bone_name in switch_plans:
+        constraint = follow_constraint(ao.pose.bones[bone_name])
+        follow_paths.add(constraint.path_from_id("influence"))
     all_fcurves = []
     for act in all_actions:
         fcurves = get_action_fcurves(act, slot=analysis.action_slots.get(act))
-        all_fcurves.extend(fcurves)
+        all_fcurves.extend(fcurve for fcurve in fcurves if fcurve.data_path not in follow_paths)
 
     settings = getattr(ctx.scene, "rbx_anim_settings", None)
     plan = build_bake_plan(
@@ -1028,6 +1097,10 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
         has_constraints_local,
         getattr(ctx.scene, "frame_step", 1) or 1,
     )
+    if switch_frames:
+        plan.frames = sorted(set(plan.frames).union(
+            frame for frame in switch_frames if frame_start <= frame <= frame_end
+        ))
     analysis.visual_keyframes.update(plan.keyframe_times)
 
     # 3. Single baking pass: sample -> reduce -> collect.
@@ -1118,6 +1191,13 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
             if bone_name not in current_full_pose:
                 current_full_pose[bone_name] = identity_cf
 
+        # And parent-switching bones on their baked and resume frames.
+        for bone_name, switch in switch_plans.items():
+            if bone_name not in current_full_pose and (
+                frame_in_set(switch.dense, frame) or frame_in_set(switch.resume, frame)
+            ):
+                current_full_pose[bone_name] = identity_cf
+
         for bone_name, cframe_data in current_full_pose.items():
             is_constrained = bone_name in constrained_bones
             is_non_inheriting = bone_name in non_inheriting_bones
@@ -1136,6 +1216,16 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
                 or frame_in_set(set(constraint_keyframes.keys()) if constraint_keyframes else None, frame)
                 or is_cyclic_key
             )
+
+            switch = switch_plans.get(bone_name)
+            if switch is not None and frame_in_set(switch.dense, frame):
+                # Not following its parent: the sampled pose against the
+                # original parent, every frame. Holds are marked afterwards.
+                final_kf_state[bone_name] = PoseEntry(list(cframe_data), "Linear", "Out")
+                continue
+            # Following again after a free run: a key in the bone's own easing.
+            is_switch_resume = switch is not None and frame_in_set(switch.resume, frame)
+            is_sparse_key = is_sparse_key or is_switch_resume
 
             # For cyclic bones, bake boundary frames since the animation
             # must cover the entire scene range.
@@ -1158,6 +1248,8 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
             elif is_cyclic_forced:
                 should_bake = True
             elif is_boundary_bake:
+                should_bake = True
+            elif is_switch_resume:
                 should_bake = True
             elif is_animated and is_sparse_key:
                 should_bake = True
@@ -1383,7 +1475,9 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
         for i in range(1, len(collected) - 1):
             kf_data = collected[i]
             frame_idx = collected_frames[i]
-            if frame_in_set(plan.keyframe_times, frame_idx):
+            # A switched range is baked every frame: dropping a repeated
+            # frame there would turn a hold before a move into a slow ramp.
+            if frame_in_set(plan.keyframe_times, frame_idx) or frame_in_set(switch_frames, frame_idx):
                 optimized_entries.append((kf_data, frame_idx))
                 continue
             if not keyframes_equivalent(optimized_entries[-1][0], kf_data):
@@ -1414,6 +1508,13 @@ def serialize(
     if isinstance(result, dict):
         _remap_channel_names(ao, result.get("kfs") or [])
         markers = export_pose_markers(ao)
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if getattr(settings, "rbx_parent_switch_markers", False):
+            # Generated from the follow keys; ones that came back from Studio
+            # would duplicate them or point at old switch frames.
+            markers = [marker for marker in markers if marker.get("name") != PARENT_SWITCH_MARKER]
+            markers.extend(parent_switch_markers(ao))
+            markers.sort(key=lambda marker: marker["time"])
         if markers:
             result["markers"] = markers
         warnings = []
@@ -1449,7 +1550,11 @@ def _serialize_evaluated(ao, target_bone_rest=None):
     visual_bones.update(
         b.name for b in ao.pose.bones
         if not b.bone.use_inherit_rotation
-        or (b.bone.get("worldspace_bone") and b.bone.get("worldspace_original_parent"))
+        or (
+            b.bone.get("worldspace_bone") and b.bone.get("worldspace_original_parent")
+            # Parent-switching bones keep their sparse keys where they follow.
+            and follow_constraint(b) is None
+        )
     )
     if analysis.is_skinned_rig:
         visual_bones = get_deform_descendant_bones(ao, visual_bones)
@@ -1478,21 +1583,30 @@ def _serialize_evaluated(ao, target_bone_rest=None):
             visual_bones.update(name for key in collected for name in key.poses)
         if analysis.is_skinned_rig:
             visual_bones = get_deform_descendant_bones(ao, visual_bones)
+        sample_cache = {}
+
+        def sample_visual(frame, bone_names=None):
+            whole = math.floor(frame)
+            ctx.scene.frame_set(whole, subframe=frame - whole)
+            return serialize_combined_animation_state(
+                ao, ao.evaluated_get(analysis.depsgraph), analysis.run_deform_path,
+                analysis.is_skinned_rig, analysis.back_trans_cached,
+                analysis.world_transform_cached, analysis.scale_factor_cached,
+                sample_cache, analysis.excluded_face_bones, bone_names=bone_names,
+            )
+
+        switch_plans = {
+            name: switch for name, switch in analysis.switch_plans.items()
+            if name not in visual_bones
+        }
+        if switch_plans:
+            mark_switch_holds(
+                collected, switch_plans, sample_visual, ctx.scene.frame_start,
+                analysis.desired_fps,
+            )
         visual_diagnostics = {}
         if visual_bones:
             from .visual_bake import bake_at_frame_rate
-
-            sample_cache = {}
-
-            def sample_visual(frame, bone_names=None):
-                whole = math.floor(frame)
-                ctx.scene.frame_set(whole, subframe=frame - whole)
-                return serialize_combined_animation_state(
-                    ao, ao.evaluated_get(analysis.depsgraph), analysis.run_deform_path,
-                    analysis.is_skinned_rig, analysis.back_trans_cached,
-                    analysis.world_transform_cached, analysis.scale_factor_cached,
-                    sample_cache, analysis.excluded_face_bones, bone_names=bone_names,
-                )
 
             collected = bake_at_frame_rate(
                 collected, visual_bones, sample_visual, ctx.scene.frame_start,

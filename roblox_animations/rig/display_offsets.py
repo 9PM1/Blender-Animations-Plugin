@@ -102,7 +102,10 @@ def refresh_display_offsets(armature_obj, previous_rest=None) -> list[str]:
         moved[bone.name] = (old_rest, new_rest)
 
     if moved:
+        from ..animation.parent_switch import keep_follow_constraints
+
         _keep_bound_objects_in_place(armature_obj, moved)
+        keep_follow_constraints(armature_obj, moved)
         print(
             f"Blender Addon: kept the Roblox joints of {len(moved)} edited bone(s) on "
             f"'{armature_obj.name}'; attached parts stay where they were."

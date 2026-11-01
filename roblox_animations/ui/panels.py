@@ -273,6 +273,49 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
                     icon="UNLINKED",
                 )
 
+        # Keyable parent switching for the selected bones
+        if (
+            selected_armature
+            and selected_armature.mode == "POSE"
+            and context.active_object == selected_armature
+        ):
+            from ..animation.parent_switch import can_switch_parent, follows_parent
+            from ..core.utils import pose_bone_selected
+
+            switch_bones = [
+                b for b in selected_armature.pose.bones
+                if pose_bone_selected(b) and can_switch_parent(b)
+            ]
+            if switch_bones:
+                switch_box = col.box()
+                switch_box.label(text="Parent Switching", icon="CON_CHILDOF")
+                for b in switch_bones[:6]:
+                    follows = follows_parent(b)
+                    row = switch_box.row(align=True)
+                    row.label(text=b.name, icon="BONE_DATA")
+                    op = row.operator(
+                        "object.rbxanims_parent_switch",
+                        text="Follows Parent" if follows else "Free",
+                        icon="LINKED" if follows else "UNLINKED",
+                        depress=follows,
+                    )
+                    op.bone_name = b.name
+                    op.keep_position = False
+                if len(switch_bones) > 6:
+                    switch_box.label(text=f"+{len(switch_bones) - 6} more selected")
+                op = switch_box.operator(
+                    "object.rbxanims_parent_switch",
+                    text="Switch Here, Keep Position",
+                    icon="PINNED",
+                )
+                op.bone_name = ""
+                op.keep_position = True
+                switch_box.prop(settings, "rbx_parent_switch_markers")
+                note = switch_box.column(align=True)
+                note.scale_y = 0.7
+                note.label(text="Baked compensation follows only", icon="INFO")
+                note.label(text="this animation's parent motion.", icon="BLANK1")
+
         # Show IK-FK slider if an IK target with the property is selected
         if selected_ik_target:
             ikfk_box = col.box()

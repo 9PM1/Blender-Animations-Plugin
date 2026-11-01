@@ -32,6 +32,7 @@ from .rig_ops import (
     OBJECT_OT_WorldSpaceUnparent,
     OBJECT_OT_WorldSpaceReparent,
 )
+from .parent_switch_ops import OBJECT_OT_ParentSwitch
 from .animation_ops import (
     OBJECT_OT_ApplyTransform,
     OBJECT_OT_MapKeyframes,
@@ -87,6 +88,8 @@ __all__ = [
     "OBJECT_OT_ToggleWeldBones",
     "OBJECT_OT_WorldSpaceUnparent",
     "OBJECT_OT_WorldSpaceReparent",
+    # Parent switching
+    "OBJECT_OT_ParentSwitch",
     # Animation operators
     "OBJECT_OT_ApplyTransform",
     "OBJECT_OT_MapKeyframes",
