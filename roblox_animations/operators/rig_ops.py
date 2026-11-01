@@ -5,7 +5,12 @@ Rig generation and management operators.
 import bpy
 from ..rig.creation import create_rig
 from ..rig.ik import create_ik_config, remove_ik_config, has_ik_constraint, update_pole_axis
+from ..rig import controls as rig_controls
+from ..rig import display_offsets, pivots
+from ..core.editor_state import preserved_editor_state
 from ..core.utils import (
+    CONTROL_BONE_PROP,
+    PENDING_STUDIO_PIVOT_PROP,
     pose_bone_selected,
     pose_bone_set_selected,
     iter_scene_objects,
@@ -1658,4 +1663,304 @@ class OBJECT_OT_WorldSpaceReparent(bpy.types.Operator):
         if n_e:
             parts.append(f"{n_e} baked")
         self.report({"INFO"}, f"restored parent on {restored} bone(s) ({', '.join(parts)})")
+        return {"FINISHED"}
+
+
+def _selected_joint_bones(context):
+    """Selected pose bones that stand for a Roblox joint."""
+    obj = context.active_object
+    if not obj or obj.type != "ARMATURE" or obj.mode != "POSE":
+        return []
+    return [
+        pb.name for pb in obj.pose.bones
+        if pose_bone_selected(pb) and display_offsets.is_joint_bone(pb.bone)
+    ]
+
+
+def _controls_note(ao, names):
+    if set(rig_controls.driven_bones(ao)).intersection(names):
+        return " Its controls still turn it about the old pivot; remove and add them again to rebuild them."
+    return ""
+
+
+class OBJECT_OT_PivotToCursor(bpy.types.Operator):
+    """Move the rotation pivot of the selected bones to the 3D cursor"""
+    bl_label = "Set Pivot to 3D Cursor"
+    bl_idname = "object.rbxanims_pivot_to_cursor"
+    bl_description = (
+        "Move the selected bones' rotation pivot (their head) to the 3D cursor. "
+        "Their Roblox joints, the parts and the export at rest stay the same"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_selected_joint_bones(context))
+
+    def execute(self, context):
+        ao = context.active_object
+        names = _selected_joint_bones(context)
+        cursor = ao.matrix_world.inverted() @ context.scene.cursor.location
+        moved = pivots.move_pivots(ao, {name: cursor for name in names})
+        if not moved:
+            self.report({"INFO"}, "The pivot is already at the 3D cursor.")
+            return {"FINISHED"}
+        self.report(
+            {"INFO"},
+            f"Moved the pivot of {len(moved)} bone(s); their Roblox joints are unchanged."
+            + _controls_note(ao, moved),
+        )
+        return {"FINISHED"}
+
+
+class OBJECT_OT_ResetPivot(bpy.types.Operator):
+    """Put the selected bones' pivots back on their Roblox joints"""
+    bl_label = "Reset Pivot"
+    bl_idname = "object.rbxanims_reset_pivot"
+    bl_description = "Move the selected bones' rotation pivot back to their Roblox joint"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_selected_joint_bones(context))
+
+    def execute(self, context):
+        ao = context.active_object
+        moved = pivots.reset_pivots(ao, _selected_joint_bones(context))
+        if not moved:
+            self.report({"INFO"}, "The selected pivots are already on their Roblox joints.")
+            return {"FINISHED"}
+        self.report(
+            {"INFO"},
+            f"Reset the pivot of {len(moved)} bone(s) to the Roblox joint."
+            + _controls_note(ao, moved),
+        )
+        return {"FINISHED"}
+
+
+class OBJECT_OT_SetBoneShape(bpy.types.Operator):
+    """Draw the selected bones as a sphere, ring or arrow"""
+    bl_label = "Bone Shape"
+    bl_idname = "object.rbxanims_bone_shape"
+    bl_description = "Draw the selected bones as a handle. Only the display changes; the export doesn't"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    shape: bpy.props.EnumProperty(
+        name="Shape",
+        items=[
+            ("SPHERE", "Sphere", "A sphere around the pivot"),
+            ("RING", "Ring", "A ring around the bone"),
+            ("ARROW", "Arrow", "An arrow along the bone"),
+            ("NONE", "Default", "The normal bone display"),
+        ],
+        default="SPHERE",
+    )
+    size: bpy.props.FloatProperty(name="Size", default=1.0, min=0.05, max=20.0)
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj is not None
+            and obj.type == "ARMATURE"
+            and obj.mode == "POSE"
+            and any(pose_bone_selected(pb) for pb in obj.pose.bones)
+        )
+
+    def execute(self, context):
+        ao = context.active_object
+        selected = [pb for pb in ao.pose.bones if pose_bone_selected(pb)]
+        shape = None if self.shape == "NONE" else self.shape
+        with display_offsets.keep_joints(ao):
+            for pose_bone in selected:
+                rig_controls.set_bone_shape(pose_bone, shape, self.size)
+        self.report({"INFO"}, f"Changed the shape of {len(selected)} bone(s).")
+        return {"FINISHED"}
+
+
+class OBJECT_OT_WritePivotToStudio(bpy.types.Operator):
+    """Queue the selected bones' pivots as joint changes for the Studio rig"""
+    bl_label = "Write Pivot to Studio Rig"
+    bl_idname = "object.rbxanims_write_pivot_to_studio"
+    bl_description = (
+        "Queue a change to these joints' C0 and C1 so the Studio rig turns about "
+        "the same pivot (the parts don't move). Every export carries it until "
+        "Studio applies it; until then the animation plays on the current joints"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_selected_joint_bones(context))
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(
+            self,
+            event,
+            message=(
+                "Change these joints' C0 and C1 in the Studio rig so they turn "
+                "about the new pivot? The game's Motor6Ds change too."
+            ),
+        )
+
+    def execute(self, context):
+        ao = context.active_object
+        queued, on_joint = pivots.queue_studio_pivots(ao, _selected_joint_bones(context))
+        if not queued:
+            self.report({"WARNING"}, "The selected pivots are on their Roblox joints; there is nothing to write.")
+            return {"CANCELLED"}
+        message = (
+            f"Queued {len(queued)} joint change(s) for the Studio rig. Exports keep "
+            "playing on the current joints until Studio applies them."
+        )
+        if on_joint:
+            message += f" Skipped {len(on_joint)} bone(s) whose pivot is on its joint."
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class OBJECT_OT_KeepPivotInBlender(bpy.types.Operator):
+    """Drop the queued Studio joint change for the selected bones"""
+    bl_label = "Keep Pivot in Blender"
+    bl_idname = "object.rbxanims_keep_pivot_in_blender"
+    bl_description = (
+        "Don't change the Studio rig for the selected bones; their pivot stays "
+        "a Blender-side offset on the current joint"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return any(
+            obj.data.bones[name].get(PENDING_STUDIO_PIVOT_PROP)
+            for name in _selected_joint_bones(context)
+        )
+
+    def execute(self, context):
+        cancelled = pivots.cancel_studio_pivots(context.active_object, _selected_joint_bones(context))
+        self.report({"INFO"}, f"Dropped {len(cancelled)} queued joint change(s).")
+        return {"FINISHED"}
+
+
+def _controls_target(context):
+    """The armature the Add/Remove Controls buttons act on."""
+    ao = _resolve_autophysics_armature(context)
+    if ao is None or ao.mode == "EDIT":
+        return None
+    return ao
+
+
+class OBJECT_OT_AddControls(bpy.types.Operator):
+    """Add animation controls to the rig"""
+    bl_label = "Add Controls"
+    bl_idname = "object.rbxanims_add_controls"
+    bl_description = (
+        "Add control bones in their own collection: IK targets and poles for the "
+        "arms and legs, a root mover and a grip handle on each hand. The joint "
+        "bones follow them and the export bakes what they show"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    match_animation: bpy.props.BoolProperty(
+        name="Key the controls to the current animation",
+        description=(
+            "Key the controls on every frame so the arms and legs keep playing "
+            "the animation they have now"
+        ),
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        ao = _controls_target(context)
+        return (
+            ao is not None
+            and not rig_controls.has_controls(ao)
+            and any(display_offsets.is_joint_bone(bone) for bone in ao.data.bones)
+        )
+
+    def invoke(self, context, event):
+        ao = _controls_target(context)
+        limbs = rig_controls.describe_rig(ao)["limbs"]
+        if not _has_any_keys(ao, [name for limb in limbs for name in limb["chain"]]):
+            self.match_animation = False
+            return self.execute(context)
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        ao = _controls_target(context)
+        with preserved_editor_state():
+            try:
+                layout = rig_controls.add_controls(ao)
+            except ValueError as exc:
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+            chains = [name for limb in layout["limbs"] for name in limb["chain"]]
+            keyed = 0
+            if self.match_animation and _has_any_keys(ao, chains):
+                start, end = _get_action_frame_range(ao)
+                keyed = rig_controls.match_controls_to_pose(ao, range(start, end + 1))
+        if not layout["limbs"]:
+            self.report({"WARNING"}, "No arms or legs were recognised; added the root mover only.")
+            return {"FINISHED"}
+        message = (
+            f"Added controls to '{ao.name}': IK for {len(layout['limbs'])} limb(s), "
+            "a root mover and grip handles."
+        )
+        if keyed:
+            message += f" Keyed them to the current animation on {keyed} frame(s)."
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class OBJECT_OT_RemoveControls(bpy.types.Operator):
+    """Remove the animation controls from the rig"""
+    bl_label = "Remove Controls"
+    bl_idname = "object.rbxanims_remove_controls"
+    bl_description = (
+        "Delete the control bones and their constraints; the rig goes back to "
+        "plain joint bones"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    keep_motion: bpy.props.BoolProperty(
+        name="Bake the controls' motion onto the bones",
+        description=(
+            "Key the bones on every frame so the animation looks the same without "
+            "the controls. Off: the bones get back the keys they had under the controls"
+        ),
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        ao = _controls_target(context)
+        return ao is not None and rig_controls.has_controls(ao)
+
+    def invoke(self, context, event):
+        ao = _controls_target(context)
+        names = [bone.name for bone in ao.data.bones if bone.get(CONTROL_BONE_PROP)]
+        self.keep_motion = _has_any_keys(ao, names)
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        ao = _controls_target(context)
+        with preserved_editor_state():
+            driven = rig_controls.driven_bones(ao)
+            samples = None
+            if self.keep_motion and driven:
+                start, end = _get_action_frame_range(ao)
+                samples = _sample_world_matrices(ao, driven, start, end)
+            try:
+                rig_controls.remove_controls(ao)
+            except ValueError as exc:
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+            if samples:
+                _rekey_bones_with_matrices(ao, samples)
+        if samples:
+            self.report({"INFO"}, f"Removed the controls and baked their motion onto {len(driven)} bone(s).")
+        else:
+            self.report({"INFO"}, "Removed the controls; the bones play their own keys again.")
         return {"FINISHED"}

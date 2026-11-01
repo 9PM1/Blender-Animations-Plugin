@@ -18,7 +18,7 @@ from ..core.constants import (
     get_transform_to_blender,
     identity_cf,
 )
-from ..core.utils import mat_to_cf, to_matrix
+from ..core.utils import is_control_bone, mat_to_cf, to_matrix
 from .face_controls import is_face_control_bone
 from .scale import (
     _SCALE_EPSILON,
@@ -56,7 +56,8 @@ def _sampling_layout(ao, cache):
         return layout
     motor, deform, worldspace = [], [], {}
     for bone in ao.pose.bones:
-        if is_face_control_bone(bone):
+        # Animation controls drive the joints; only the joints are channels.
+        if is_face_control_bone(bone) or is_control_bone(bone):
             continue
         if all(key in bone.bone for key in ("transform", "transform1", "nicetransform")):
             motor.append(bone.name)

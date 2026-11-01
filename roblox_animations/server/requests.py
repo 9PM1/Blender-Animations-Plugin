@@ -1045,6 +1045,9 @@ def execute_get_bone_rest(task_id, armature_name):
             ]
 
         for bone in sorted_bones:
+            # Animation controls never become Studio bones or joints.
+            if utils.is_control_bone(bone):
+                continue
             is_imported_deform_bone = bool(bone.get("rbx_is_deform_bone", False))
             has_motor6d_props = (not is_imported_deform_bone) and (
                 "transform" in bone

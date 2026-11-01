@@ -25,6 +25,7 @@ from ..core.utils import (
     get_action_fcurves,
     get_animation_data_action_slot,
     get_scene_fps,
+    is_control_bone,
     iter_scene_objects,
 )
 from .easing import map_blender_to_roblox_easing, easing_requires_bake
@@ -227,7 +228,7 @@ def extract_bone_hierarchy(armature: "bpy.types.Object") -> Dict[str, Optional[s
         return hierarchy
 
     for bone in armature.data.bones:
-        if is_face_control_bone(bone):
+        if is_face_control_bone(bone) or is_control_bone(bone):
             continue
         # Studio resolves these by its own part/bone names.
         name = export_channel_name(bone)
@@ -349,6 +350,7 @@ def collect_export_warnings(ao, analysis=None) -> List[str]:
     for pose_bone in ao.pose.bones:
         if any(abs(value - 1.0) > 1e-4 for value in pose_bone.scale):
             scaled.add(pose_bone.name)
+    scaled = {name for name in scaled if name not in ao.pose.bones or not is_control_bone(ao.pose.bones[name])}
     if scaled:
         names = sorted(scaled)
         warnings.append(
@@ -449,7 +451,8 @@ def get_all_constrained_bones(armature_obj: "bpy.types.Object") -> Set[str]:
             for constraint in bone.constraints:
                 if constraint.type in {"IK", "SPLINE_IK"}:
                     add_ik_chain(bone, getattr(constraint, "chain_count", 0))
-    return constrained_bones
+    # Control bones are inputs; the joints they drive are what gets baked.
+    return {name for name in constrained_bones if not is_control_bone(armature_obj.pose.bones[name])}
 
 
 def get_deform_descendant_bones(
@@ -469,7 +472,7 @@ def get_deform_descendant_bones(
 
     while stack:
         pose_bone = stack.pop()
-        if is_face_control_bone(pose_bone):
+        if is_face_control_bone(pose_bone) or is_control_bone(pose_bone):
             continue
         affected_bones.add(pose_bone.name)
         stack.extend(pose_bone.children)
@@ -497,7 +500,9 @@ def get_all_driven_bones(armature_obj: "bpy.types.Object") -> Set[str]:
             continue
         match = bone_name_pattern.search(data_path)
         if match:
-            driven_bones.add(match.group(1))
+            pose_bone = armature_obj.pose.bones.get(match.group(1))
+            if pose_bone is None or not is_control_bone(pose_bone):
+                driven_bones.add(match.group(1))
 
     return driven_bones
 
@@ -680,6 +685,7 @@ def _analyze_export(
             and "nicetransform" in bone.bone
         )
         and not is_face_control_bone(bone)
+        and not is_control_bone(bone)
         for bone in ao_eval.pose.bones
     )
     force_deform = getattr(settings, "force_deform_bone_serialization", False)
@@ -828,7 +834,7 @@ def _bake_full(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]]:
     if driven_bones:
         constrained_bones.update(driven_bones)
     for bone in ao.pose.bones:
-        if not bone.bone.use_inherit_rotation:
+        if not bone.bone.use_inherit_rotation and not is_control_bone(bone):
             constrained_bones.add(bone.name)
     if analysis.is_skinned_rig:
         constrained_bones = get_deform_descendant_bones(ao, constrained_bones)
@@ -937,6 +943,8 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
     non_inheriting_bones: Set[str] = set()
     worldspace_parent_map: Dict[str, str] = {}
     for bone in ao.pose.bones:
+        if is_control_bone(bone):
+            continue
         if not bone.bone.use_inherit_rotation:
             non_inheriting_bones.add(bone.name)
         if bone.bone.get("worldspace_bone"):
@@ -963,7 +971,9 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
             if fcurve.data_path.startswith("pose.bones"):
                 match = POSE_BONE_PATH_PATTERN.search(fcurve.data_path)
                 if match:
-                    animated_bones.add(match.group(1))
+                    pose_bone = ao.pose.bones.get(match.group(1))
+                    if pose_bone is None or not is_control_bone(pose_bone):
+                        animated_bones.add(match.group(1))
 
     face_export_context = _build_face_control_export_context(
         ao,
@@ -977,6 +987,8 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
 
     # Also find bones driven by constrained targets and gather their actions.
     for bone in ao.pose.bones:
+        if is_control_bone(bone):
+            continue
         for constraint in bone.constraints:
             if (
                 hasattr(constraint, "target")
@@ -1416,6 +1428,13 @@ def serialize(
         markers = export_pose_markers(ao)
         if markers:
             result["markers"] = markers
+        from ..rig.pivots import pending_rig_changes
+
+        rig_changes = pending_rig_changes(ao)
+        if rig_changes:
+            # Joint changes queued for the Studio rig; the poses above are
+            # still relative to the joints Studio has now.
+            result["rig_changes"] = rig_changes
         warnings = []
         try:
             warnings.extend(collect_export_warnings(ao))

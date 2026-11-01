@@ -173,6 +173,14 @@ _classes = [
     # World-space unparent
     _resolve_operator_class("OBJECT_OT_WorldSpaceUnparent"),
     _resolve_operator_class("OBJECT_OT_WorldSpaceReparent"),
+    # Pivots, bone shapes and animation controls
+    _resolve_operator_class("OBJECT_OT_PivotToCursor"),
+    _resolve_operator_class("OBJECT_OT_ResetPivot"),
+    _resolve_operator_class("OBJECT_OT_SetBoneShape"),
+    _resolve_operator_class("OBJECT_OT_WritePivotToStudio"),
+    _resolve_operator_class("OBJECT_OT_KeepPivotInBlender"),
+    _resolve_operator_class("OBJECT_OT_AddControls"),
+    _resolve_operator_class("OBJECT_OT_RemoveControls"),
     # Animation operators
     _resolve_operator_class("OBJECT_OT_ApplyTransform"),
     _resolve_operator_class("OBJECT_OT_MapKeyframes"),

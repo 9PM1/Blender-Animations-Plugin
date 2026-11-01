@@ -16,9 +16,15 @@ exporter encodes as rotation plus offset on the original Roblox joint.
 
 Bones that weren't edited are never touched, so rigs whose offsets came from
 older versions keep exporting exactly as before.
+
+Tools that change bone rests themselves (the pivot tools, the bone-shape
+picker, "Add controls") run inside ``keep_joints``, which applies this same
+refresh as soon as they are done.
 """
 
 from __future__ import annotations
+
+from contextlib import contextmanager
 
 import bpy
 from bpy.app.handlers import persistent
@@ -43,7 +49,7 @@ def _max_difference(left: Matrix, right: Matrix) -> float:
     return max(abs(left[row][column] - right[row][column]) for row in range(4) for column in range(4))
 
 
-def _is_joint_bone(bone) -> bool:
+def is_joint_bone(bone) -> bool:
     return (
         not bone.get("rbx_is_deform_bone", False)
         and all(key in bone for key in ("transform", "transform1", "nicetransform"))
@@ -55,7 +61,7 @@ def snapshot_rest(armature_obj) -> dict[str, Matrix]:
     return {
         bone.name: bone.matrix_local.copy()
         for bone in armature_obj.data.bones
-        if _is_joint_bone(bone)
+        if is_joint_bone(bone)
     }
 
 
@@ -76,7 +82,7 @@ def refresh_display_offsets(armature_obj, previous_rest=None) -> list[str]:
     t2b = get_transform_to_blender()
     moved = {}
     for bone in armature_obj.data.bones:
-        if not _is_joint_bone(bone):
+        if not is_joint_bone(bone):
             continue
         try:
             nice = to_matrix(bone["nicetransform"])
@@ -103,6 +109,8 @@ def refresh_display_offsets(armature_obj, previous_rest=None) -> list[str]:
 
     if moved:
         _keep_bound_objects_in_place(armature_obj, moved)
+        # The exporter reads the evaluated bones; make them pick up the offsets.
+        armature_obj.data.update_tag()
         print(
             f"Blender Addon: kept the Roblox joints of {len(moved)} edited bone(s) on "
             f"'{armature_obj.name}'; attached parts stay where they were."
@@ -140,6 +148,66 @@ def begin_edit_session(armature_obj) -> None:
     key = armature_obj.as_pointer()
     if key not in _edit_sessions:
         _edit_sessions[key] = (armature_obj.name, snapshot_rest(armature_obj))
+
+
+def finish_edit_session(armature_obj) -> list[str]:
+    """Refresh an armature whose rest edits are done; returns the moved bones.
+
+    While the armature is still in Edit Mode its session stays open for the
+    handler to finish when the user leaves.
+    """
+    global _refreshing
+    if armature_obj is None or armature_obj.mode == "EDIT":
+        return []
+    session = _edit_sessions.pop(armature_obj.as_pointer(), None)
+    if session is None:
+        return []
+    _refreshing = True
+    try:
+        return refresh_display_offsets(armature_obj, session[1])
+    finally:
+        _refreshing = False
+
+
+@contextmanager
+def edit_mode(armature_obj):
+    """Edit Mode for the block, then back to the mode the armature was in."""
+    view_layer = bpy.context.view_layer
+    previous_active = view_layer.objects.active
+    previous_mode = armature_obj.mode
+    if previous_mode == "EDIT":
+        yield
+        return
+    view_layer.objects.active = armature_obj
+    bpy.ops.object.mode_set(mode="EDIT")
+    try:
+        yield
+    finally:
+        bpy.ops.object.mode_set(mode=previous_mode)
+        if previous_active is not None:
+            view_layer.objects.active = previous_active
+
+
+@contextmanager
+def keep_joints(armature_obj):
+    """Change bone rests inside the block; every Roblox joint and part stays put.
+
+    Yields a list that holds the names of the bones that moved once the block
+    is done (the depsgraph handler may have done the refresh by then).
+    """
+    moved: list[str] = []
+    before = snapshot_rest(armature_obj)
+    begin_edit_session(armature_obj)
+    try:
+        yield moved
+    finally:
+        finish_edit_session(armature_obj)
+        if armature_obj.mode != "EDIT":
+            for name, rest in snapshot_rest(armature_obj).items():
+                old = before.get(name)
+                tolerance = _TOLERANCE * max(1.0, max(abs(value) for value in rest.translation))
+                if old is not None and _max_difference(old, rest) > tolerance:
+                    moved.append(name)
 
 
 def _session_object(key, name):
