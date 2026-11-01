@@ -306,7 +306,8 @@ return function()
 				State.weaponConnectionStatus:set("")
 			end)
 
-			it("should detect Weld connection between weapon and rig", function()
+			-- A weld holds the weapon but animations can't move it (E6).
+			it("should report a Weld connection that can't be animated", function()
 				local weapon = Instance.new("Part")
 				weapon.Name = "Handle"
 				weapon.Parent = workspace
@@ -322,7 +323,9 @@ return function()
 				exportManager:detectWeaponConnection()
 
 				local status = State.weaponConnectionStatus:get()
-				expect(status:find(utf8.char(0x2713))).to.be.ok()
+				expect(status:find("Weld: RightHand → Handle", 1, true)).to.be.ok()
+				expect(status:find("can't be animated", 1, true)).to.be.ok()
+				expect(status:find(utf8.char(0x2713))).never.to.be.ok()
 
 				weld:Destroy()
 				weapon:Destroy()
@@ -330,7 +333,7 @@ return function()
 				State.weaponConnectionStatus:set("")
 			end)
 
-			it("should detect WeldConstraint connection between weapon and rig", function()
+			it("should report a WeldConstraint connection that can't be animated", function()
 				local weapon = Instance.new("Part")
 				weapon.Name = "Handle"
 				weapon.Parent = workspace
@@ -345,7 +348,9 @@ return function()
 				exportManager:detectWeaponConnection()
 
 				local status = State.weaponConnectionStatus:get()
-				expect(status:find(utf8.char(0x2713))).to.be.ok()
+				expect(status:find("WeldConstraint: RightHand → Handle", 1, true)).to.be.ok()
+				expect(status:find("can't be animated", 1, true)).to.be.ok()
+				expect(status:find(utf8.char(0x2713))).never.to.be.ok()
 
 				wc:Destroy()
 				weapon:Destroy()

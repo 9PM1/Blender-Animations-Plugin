@@ -159,8 +159,9 @@ return function()
 				expect(result.kfs[1].fc).to.be.ok()
 				expect(result.kfs[1].fc.JawDrop).to.be.ok()
 				expect(result.kfs[1].fc.JawDrop.value).to.be.near(0.75)
-				expect(result.kfs[1].fc.JawDrop.easingStyle).to.equal("Linear")
-				expect(result.kfs[1].fc.JawDrop.easingDirection).to.equal("Out")
+				-- The NumberPose's own easing travels (its default direction is In).
+				expect(result.kfs[1].fc.JawDrop.easingStyle).to.equal(smile.EasingStyle.Name)
+				expect(result.kfs[1].fc.JawDrop.easingDirection).to.equal(smile.EasingDirection.Name)
 			end)
 
 			it("should return nil for a KeyframeSequence with no keyframes", function()
@@ -194,7 +195,7 @@ return function()
 				expect(result.kfs[2].t).to.be.near(1)
 			end)
 
-			it("should normalize keyframe times based on the first keyframe", function()
+			it("should keep keyframe times absolute", function()
 				local kfs = Instance.new("KeyframeSequence")
 				local kf1 = Instance.new("Keyframe")
 				kf1.Time = 1
@@ -213,10 +214,11 @@ return function()
 				local rig = { isDeformRig = false, bones = {}, ToRobloxAnimation = function() return kfs end }
 				local result = serializer:serialize(kfs, rig)
 
+				-- An animation that starts later keeps its start (R3).
 				expect(result).to.be.ok()
-				expect(result.kfs[1].t).to.be.near(0)
-				expect(result.kfs[2].t).to.be.near(1)
-				expect(result.t).to.be.near(1)
+				expect(result.kfs[1].t).to.be.near(1)
+				expect(result.kfs[2].t).to.be.near(2)
+				expect(result.t).to.be.near(2)
 			end)
 
 			it("should handle deform rigs correctly", function()

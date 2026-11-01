@@ -130,7 +130,9 @@ return function()
 			end
 		end)
 
-		it("should still reject same-name motor6ds under the same parent", function()
+		-- Same-name joints under one parent can't be told apart: the load goes
+		-- on, skips that channel and reports it (S7).
+		it("should skip and report same-name motor6ds under the same parent", function()
 			local torso = mock_rig:FindFirstChild("Torso")
 			expect(torso).to.be.ok()
 
@@ -161,7 +163,13 @@ return function()
 					},
 				})
 			end)
-			expect(success).to.equal(false)
+			expect(success).to.equal(true)
+			expect(table.find(rig.lastLoadReport.ambiguous, "DupJoint")).to.be.ok()
+			for _, rigPart in pairs(rig:GetRigParts()) do
+				if rigPart.part == partA or rigPart.part == partB then
+					expect(next(rigPart.poses)).never.to.be.ok()
+				end
+			end
 		end)
 
 		it("should build head chains connected by animationconstraints", function()
@@ -435,14 +443,14 @@ return function()
 			local kfs_out = rig:ToRobloxAnimation()
 			local keyframes_out = kfs_out:GetKeyframes()
 
-			-- Verify
-			expect(#keyframes_out).to.equal(#styles * #directions) -- It should be exactly the number of keyframes we created
+			-- Verify: the keyframes we created, at their own (absolute) times,
+			-- plus the keyframe the rig always writes at 0.
+			expect(#keyframes_out).to.equal(#styles * #directions + 1)
 
 			local i = 1
 			for _, style in ipairs(styles) do
 				for _, dir in ipairs(directions) do
-					-- Find the keyframe at the correct, NORMALIZED time
-					local time_to_find = i - 1
+					local time_to_find = i
 					local kf_out = nil
 					for _, kf in ipairs(keyframes_out) do
 						if math.abs(kf.Time - time_to_find) < 0.001 then
