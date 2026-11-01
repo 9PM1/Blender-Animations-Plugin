@@ -8,20 +8,25 @@ blender --background --factory-startup --online-mode --python <runner> -- test_p
 
 from __future__ import annotations
 
+import http.client
 import json
 import math
+import threading
+import time
 import unittest
+import urllib.parse
 
 import bpy
 from mathutils import Euler, Matrix, Quaternion, Vector
 
-from .test_ledger_fixes import channel_names, export, key_rotation, r6_rig
+from .test_ledger_fixes import channel_names, export, free_port_pair, key_rotation, r6_rig
 from .test_rbxm_rebuild import import_binary, template_binary
 from ..core import utils
 from ..core.constants import get_transform_to_blender
 from ..core.utils import cf_to_mat, mat_to_cf, to_matrix
 from ..rig import controls, display_offsets, pivots
 from ..server import dispatch, live_sync_delta, requests
+from ..server import server as server_module
 
 T2B = get_transform_to_blender()
 IDENTITY = mat_to_cf(Matrix.Identity(4))
@@ -386,6 +391,229 @@ class TestPivots(ExportChecks):
         previous = {"t": 1.0, "kfs": [{"t": 0.0, "kf": {}}]}
         current = dict(previous, rig_changes=[{"type": "joint_pivot", "part1": "Right Arm"}])
         self.assertIsNone(live_sync_delta.create_delta(previous, current))
+
+
+# ---------------------------------------------------------------------------
+# Studio applies a queued pivot and confirms it (/confirm_rig_changes)
+# ---------------------------------------------------------------------------
+
+
+def keyed_frames(animation, name):
+    fps = bpy.context.scene.render.fps
+    return {round(kf["t"] * fps) for kf in animation["kfs"] if name in kf.get("kf", {})}
+
+
+def studio_conversion(change):
+    """The Studio plugin's playback of a joint once it has the change."""
+    offset = cf_to_mat(change["offset"])
+    name = change["part1"]
+
+    def convert(row):
+        row = dict(row)
+        if name in row:
+            row[name] = mat_to_cf(offset.inverted() @ cf_to_mat(row[name]) @ offset)
+        return row
+
+    return convert
+
+
+class TestStudioPivotConfirmation(ExportChecks):
+    @classmethod
+    def setUpClass(cls):
+        cls.port = free_port_pair()
+        assert server_module.start_server(cls.port), server_module.last_start_error
+
+    @classmethod
+    def tearDownClass(cls):
+        server_module.stop_server()
+
+    def setUp(self):
+        # Only the swing is keyed: the replay holds a channel between its
+        # keys, so other channels' keys would show it lagging.
+        self.armature, _ = r6_rig()
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    def request(self, method, path, body=None, headers=None):
+        """One request to the sync server, running its main-thread tick meanwhile."""
+        result = {}
+
+        def call():
+            connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
+            try:
+                connection.request(method, path, body=body, headers=headers or {})
+                response = connection.getresponse()
+                result["value"] = (response.status, json.loads(response.read()))
+            except Exception as exc:  # surfaced below
+                result["error"] = exc
+            finally:
+                connection.close()
+
+        thread = threading.Thread(target=call)
+        thread.start()
+        deadline = time.monotonic() + 30
+        while thread.is_alive() and time.monotonic() < deadline:
+            server_module._server_tick()
+            time.sleep(0.005)
+        thread.join(5)
+        if "error" in result:
+            raise result["error"]
+        return result["value"]
+
+    def confirm(self, changes, headers=None, armature=None):
+        return self.request(
+            "POST",
+            "/confirm_rig_changes/" + urllib.parse.quote(armature or self.armature.name),
+            json.dumps({"changes": changes}).encode("utf-8"),
+            {"Content-Type": "application/json", **(headers or {})},
+        )
+
+    def status(self, last_known_hash=""):
+        query = urllib.parse.urlencode({"armature": self.armature.name, "last_known_hash": last_known_hash})
+        return self.request("GET", "/animation_status?" + query)[1]
+
+    def queue_pivot(self, name, shift):
+        """Move the bone's pivot by ``shift`` and write it to the Studio rig."""
+        point = self.armature.data.bones[name].head_local + Vector(shift)
+        pivots.move_pivots(self.armature, {name: point})
+        pivots.queue_studio_pivots(self.armature, [name])
+        return point
+
+    def swing(self, name):
+        key_rotation(self.armature, name, 1, (0, 0, 0))
+        key_rotation(self.armature, name, 10, (1.5, 0.0, 0.0))
+        for curve in utils.get_action_fcurves(self.armature.animation_data.action):
+            if f'"{name}"' in curve.data_path:
+                for point in curve.keyframe_points:
+                    point.interpolation = "LINEAR"
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    def test_confirmation_rebases_the_bone_and_ends_the_change(self):
+        self.queue_pivot("Right Arm", (0.0, 0.0, -1.0))
+        self.swing("Right Arm")
+        before = export(self.armature)
+        change = before["rig_changes"][0]
+        self.assertLessEqual(set(range(10)), keyed_frames(before, "Right Arm"))
+        old_hash = self.status()["hash"]
+
+        status, data = self.confirm([change])
+
+        self.assertEqual(status, 200, data)
+        self.assertEqual((data["success"], data["applied"], data["skipped"]), (True, ["Right Arm"], []))
+        bone = self.armature.data.bones["Right Arm"]
+        self.assertNotIn(utils.PENDING_STUDIO_PIVOT_PROP, bone)
+        self.assertFalse(pivots.has_custom_pivot(bone))
+        for key, prop in (("c0", "transform0"), ("c1", "transform1")):
+            self.assertLess(max_difference(to_matrix(bone[prop]), cf_to_mat(change[key])), 1e-6)
+        # Polling Studio sees the change at once, not when the hash cache expires.
+        self.assertTrue(self.status(old_hash)["has_update"])
+
+        after = self.assert_export_matches_blender(self.armature)
+        self.assertNotIn("rig_changes", after)
+        self.assertEqual(keyed_frames(after, "Right Arm"), {0, 9})
+        # Studio's conversion of the export it applied plays the same poses.
+        converted, rebased = rows(before), rows(after)
+        for frame in (0, 9):
+            expected = studio_conversion(change)(converted[frame])["Right Arm"]
+            actual = rebased[frame]["Right Arm"]
+            self.assertLess(max(abs(a - b) for a, b in zip(expected, actual)), 1e-5, frame)
+
+    def test_confirmation_is_checked_like_the_other_endpoints(self):
+        self.queue_pivot("Right Arm", (0.0, 0.0, -1.0))
+        change = pivots.pending_rig_changes(self.armature)[0]
+        self.assertEqual(self.confirm([change], headers={"Origin": "https://evil.example"})[0], 403)
+        self.assertEqual(self.confirm([change], headers={"Host": "evil.example:80"})[0], 403)
+        self.assertEqual(self.confirm([change], headers={"Content-Type": "text/plain"})[0], 415)
+        status, data = self.confirm([change], armature="NoSuchRig")
+        self.assertEqual(status, 500)
+        self.assertIn("not found", data["message"])
+        status, _ = self.request(
+            "POST",
+            "/confirm_rig_changes/" + urllib.parse.quote(self.armature.name),
+            b"{}",
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
+        self.assertTrue(self.armature.data.bones["Right Arm"].get(utils.PENDING_STUDIO_PIVOT_PROP))
+
+    def test_a_pivot_moved_again_stays_queued_for_the_rest(self):
+        self.queue_pivot("Right Arm", (0.0, 0.0, -1.0))
+        first = pivots.pending_rig_changes(self.armature)[0]
+        # Moved again before Studio's confirmation of the first change arrives.
+        final = self.queue_pivot("Right Arm", (0.0, 0.0, -0.5))
+
+        self.assertEqual(pivots.confirm_studio_changes(self.armature, [first]), (["Right Arm"], []))
+
+        bone = self.armature.data.bones["Right Arm"]
+        self.assertLess(max_difference(to_matrix(bone["transform0"]), cf_to_mat(first["c0"])), 1e-6)
+        self.assertTrue(bone.get(utils.PENDING_STUDIO_PIVOT_PROP))
+        second = pivots.pending_rig_changes(self.armature)[0]
+        for key in ("c0", "c1"):
+            self.assertLess(max_difference(cf_to_mat(second["previous_" + key]), cf_to_mat(first[key])), 1e-6)
+        joint = to_matrix(bone["transform"]) @ cf_to_mat(second["c1"])
+        self.assertLess(((T2B @ joint).to_translation() - final).length, 1e-4)
+        # Studio, on the first change's joint, plays the next export once it applies the second.
+        self.swing("Right Arm")
+        animation = export(self.armature)
+        self.assert_export_matches_blender(
+            self.armature,
+            animation,
+            joints={"Right Arm": (cf_to_mat(second["c0"]), cf_to_mat(second["c1"]))},
+            convert=studio_conversion(animation["rig_changes"][0]),
+        )
+
+    def test_only_a_matching_joint_is_rebased(self):
+        self.queue_pivot("Right Arm", (0.0, 0.0, -1.0))
+        change = pivots.pending_rig_changes(self.armature)[0]
+        bone = self.armature.data.bones["Right Arm"]
+        original = [list(row) for row in bone["transform0"]]
+        bone["transform0"] = [
+            list(row) for row in to_matrix(bone["transform0"]) @ Matrix.Translation((0.2, 0.0, 0.0))
+        ]
+        applied, skipped = pivots.confirm_studio_changes(self.armature, [change])
+        self.assertEqual(applied, [])
+        self.assertIn("changed in Blender", skipped[0]["reason"])
+        self.assertTrue(bone.get(utils.PENDING_STUDIO_PIVOT_PROP))
+        bone["transform0"] = original
+
+        broken = dict(change, offset=mat_to_cf(Matrix.Translation((5.0, 0.0, 0.0))))
+        stranger = dict(change, part0="Head")
+        applied, skipped = pivots.confirm_studio_changes(self.armature, [broken, stranger, "junk"])
+        self.assertEqual(applied, [])
+        self.assertEqual([entry["reason"] for entry in skipped], [
+            "the change doesn't add up",
+            "no bone joins Head and Right Arm",
+            "not a joint pivot change",
+        ])
+        self.assertTrue(bone.get(utils.PENDING_STUDIO_PIVOT_PROP))
+
+    def test_studio_joint_wins_after_keep_in_blender_and_twice(self):
+        self.queue_pivot("Right Arm", (0.0, 0.0, -1.0))
+        change = pivots.pending_rig_changes(self.armature)[0]
+        # Dropped in Blender after Studio applied it: the Studio joint has
+        # changed anyway, so Blender follows it.
+        pivots.cancel_studio_pivots(self.armature, ["Right Arm"])
+        self.assertEqual(pivots.confirm_studio_changes(self.armature, [change]), (["Right Arm"], []))
+        self.assertEqual(pivots.confirm_studio_changes(self.armature, [change]), (["Right Arm"], []))
+        bone = self.armature.data.bones["Right Arm"]
+        self.assertLess(max_difference(to_matrix(bone["transform0"]), cf_to_mat(change["c0"])), 1e-6)
+        self.assertFalse(pivots.has_custom_pivot(bone))
+        self.swing("Right Arm")
+        self.assertNotIn("rig_changes", self.assert_export_matches_blender(self.armature))
+
+    def test_edit_mode_keeps_the_change_queued(self):
+        self.queue_pivot("Right Arm", (0.0, 0.0, -1.0))
+        change = pivots.pending_rig_changes(self.armature)[0]
+        bpy.context.view_layer.objects.active = self.armature
+        bpy.ops.object.mode_set(mode="EDIT")
+        try:
+            task = dispatch.new_task_id("test")
+            requests.execute_confirm_rig_changes(task, self.armature.name, [change])
+            success, message = requests.pending_responses.pop(task)
+        finally:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        self.assertFalse(success)
+        self.assertIn("Edit Mode", message)
+        self.assertTrue(self.armature.data.bones["Right Arm"].get(utils.PENDING_STUDIO_PIVOT_PROP))
 
 
 # ---------------------------------------------------------------------------

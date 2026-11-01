@@ -9,6 +9,7 @@ local Utils = require(script.Parent.Parent.Utils)
 local AnimationSerializer = require(script.Parent.Parent.Components.AnimationSerializer)
 local AnimationSimplifier = require(script.Parent.Parent.Components.AnimationSimplifier)
 local MirrorNames = require(script.Parent.Parent.Components.MirrorNames)
+local RigChanges = require(script.Parent.Parent.Components.RigChanges)
 local Undo = require(script.Parent.Parent.Components.Undo)
 local SelectionService = game:GetService("Selection")
 
@@ -60,6 +61,8 @@ type LoadOptions = {
 	title: string?,
 	detail: string?,
 	suppressErrors: boolean?,
+	-- Synced from Blender: write its queued joint changes to the rig.
+	applyRigChanges: boolean?,
 }
 
 local function clamp01(value: number): number
@@ -895,6 +898,70 @@ function AnimationManager:reportLoadProblems(animData: any)
 	end
 end
 
+-- What happened to Blender's joint changes. Problems are replaced on every
+-- load; the note about a joint that moved stays (it changed the place).
+function AnimationManager:_showRigChangeResult(result: any?)
+	local rigManager = (State :: any).rigManager
+	for _, message in ipairs(self.rigChangeProblems or {}) do
+		if rigManager and rigManager.removeWarning then
+			rigManager:removeWarning(message)
+		end
+	end
+	self.rigChangeProblems = {}
+	if not result then
+		return
+	end
+	local function show(message: string, isProblem: boolean)
+		if isProblem then
+			warn("[AnimationManager] " .. message)
+			table.insert(self.rigChangeProblems, message)
+		else
+			print("[AnimationManager] " .. message)
+		end
+		if rigManager and rigManager.addWarning then
+			rigManager:addWarning(message)
+		end
+	end
+	for _, message in ipairs(result.problems) do
+		show(message, true)
+	end
+	for _, outcome in ipairs(result.outcomes) do
+		local message = RigChanges.describe(outcome)
+		if message then
+			show(message, outcome.status ~= "applied")
+		end
+	end
+end
+
+-- Blender's queued joint changes (`rig_changes`, see RigChanges): written to
+-- the rig when `write` is set (the sync paths), and the poses of every joint
+-- that has its change converted, before anything else reads the data.
+function AnimationManager:_takeRigChanges(animData: any, write: boolean?)
+	local entries = if type(animData) == "table" then animData.rig_changes else nil
+	local result = nil
+	if type(entries) == "table" and #entries > 0 then
+		local rig = if ensureActiveRigReady(nil) then State.activeRig :: any else nil
+		result = RigChanges.apply(rig and rig.model, rig, entries, write == true)
+		RigChanges.convertPoses(animData, result.offsets)
+	end
+	-- Live-sync deltas keep the base's rig_changes; their keys convert alike.
+	self.rigChangeOffsets = if result then result.offsets else {}
+	self.lastRigChangeResult = result
+	if write then
+		self.rigChangeConfirmations = if result then RigChanges.toConfirm(result) else {}
+	end
+	self:_showRigChangeResult(result)
+end
+
+-- The joints the last sync load found with their change, for
+-- BlenderSyncManager to confirm to Blender. nil when no full sync load
+-- happened since the last call.
+function AnimationManager:takeRigChangeConfirmations(): { any }?
+	local confirmations = self.rigChangeConfirmations
+	self.rigChangeConfirmations = nil
+	return confirmations
+end
+
 -- Markers Blender sent back (pose markers) replace the Studio list.
 local function applyMarkersFromBlender(animData: any)
 	if type(animData) ~= "table" or type(animData.markers) ~= "table" or #animData.markers == 0 then
@@ -920,7 +987,7 @@ local function applyMarkersFromBlender(animData: any)
 	end
 end
 
-function AnimationManager:loadAnim(data: string, isBinary: boolean, progressContext: LoadingProgressContext?)
+function AnimationManager:loadAnim(data: string, isBinary: boolean, progressContext: LoadingProgressContext?, applyRigChanges: boolean?)
 	local decodeProgress = if progressContext then progressContext:child(0, 0.985) else nil
 	local applyProgress = if progressContext then progressContext:child(0.985, 1) else nil
 	local animData = self.animationSerializerService:deserialize(
@@ -936,7 +1003,9 @@ function AnimationManager:loadAnim(data: string, isBinary: boolean, progressCont
 	if not animData then
 		error("Failed to deserialize animation data.")
 	end
-	
+
+	self:_takeRigChanges(animData, applyRigChanges)
+
 	-- Store raw deserialized data for re-simplification on slider changes
 	self.lastRawAnimData = animData
 	State.lastRawAnimData:set(animData)
@@ -1036,7 +1105,14 @@ function AnimationManager:loadAnimDataFromText(text: string, isBinary: boolean, 
 	local suppressErrors = if options then options.suppressErrors == true else false
 	progressContext:set(0, if isBinary then "Reading binary animation" else "Reading text animation", if options then options.detail else "", false)
 
-	local ok, result = pcall(self.loadAnim, self, text, isBinary, progressContext:child(0, 0.95))
+	local ok, result = pcall(
+		self.loadAnim,
+		self,
+		text,
+		isBinary,
+		progressContext:child(0, 0.95),
+		if options then options.applyRigChanges else nil
+	)
 	if ok then
 		local success, rigResult = pcall(self.loadRig, self, nil, progressContext:child(0.95, 1))
 		if success and rigResult ~= false then
@@ -1125,6 +1201,9 @@ function AnimationManager:applyLiveSyncEnvelope(envelope: any, expectedBaseHash:
 		if envelope.base_hash ~= expectedBaseHash then
 			return false
 		end
+		-- rig_changes is the same as the base's (a change forces a full
+		-- sync), so the new keys convert the way the base's did.
+		RigChanges.convertKeyframes(envelope.upsert, self.rigChangeOffsets or {})
 		rawData = applyLiveSyncDeltaToData(self.lastRawAnimData, envelope)
 	elseif envelope.type == "animation_full" and type(envelope.animation) == "table" then
 		rawData = envelope.animation
@@ -1134,6 +1213,9 @@ function AnimationManager:applyLiveSyncEnvelope(envelope: any, expectedBaseHash:
 
 	if not rawData or not ensureActiveRigReady(nil) then
 		return false
+	end
+	if not isDelta then
+		self:_takeRigChanges(rawData, true)
 	end
 	local simplifierActive = State.simplifierEnabled:get() and State.simplifierStrength:get() > 0
 	local mirrorActive = State.mirrorAnimationEnabled:get()

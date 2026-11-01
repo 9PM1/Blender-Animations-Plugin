@@ -7,6 +7,7 @@ local _Types = require(script.Parent.Parent.types)
 local _PlaybackService = require(script.Parent.PlaybackService)
 
 local BlenderConnection = require(script.Parent.Parent.Components.BlenderConnection)
+local RigChanges = require(script.Parent.Parent.Components.RigChanges)
 
 local BlenderSyncManager = {}
 BlenderSyncManager.__index = BlenderSyncManager
@@ -16,6 +17,9 @@ local REST_DISTANCE_EPSILON = 1e-5
 -- leave live sync waiting forever).
 local SYNC_REQUEST_TIMEOUT = 15
 BlenderSyncManager.syncRequestTimeout = SYNC_REQUEST_TIMEOUT
+-- Confirming applied joint changes to Blender: tries, and the wait between.
+local RIG_CONFIRM_ATTEMPTS = 3
+BlenderSyncManager.rigConfirmRetrySeconds = 2
 
 local function showProblem(message: string?)
 	if not message or message == "" then
@@ -93,7 +97,30 @@ function BlenderSyncManager.new(playbackService: any, animationManager: any)
 	self.webSocketRequestBaseHash = ""
 	self.liveSyncPreviewScheduled = false
 	self.lastLiveSyncPreviewBuild = 0
-	
+	-- Joint changes the rig has and Blender hasn't confirmed yet.
+	self.pendingRigConfirmation = nil :: any?
+	self.isConfirmingRigChanges = false
+	self.rigConfirmMessages = {} :: { string }
+	-- Motor6D -> the change Blender rebased onto, to notice an undo.
+	self.confirmedRigJoints = {} :: { [Instance]: any }
+	self.undoneJointMessages = {} :: { [string]: boolean }
+	self.historyConnections = {} :: { RBXScriptConnection }
+	local historyOk, history = pcall(function()
+		return game:GetService("ChangeHistoryService")
+	end)
+	if historyOk and history then
+		for _, signalName in ipairs({ "OnUndo", "OnRedo" }) do
+			local signalOk, signal = pcall(function()
+				return (history :: any)[signalName]
+			end)
+			if signalOk and signal then
+				table.insert(self.historyConnections, signal:Connect(function()
+					self:_checkConfirmedJoints()
+				end))
+			end
+		end
+	end
+
 	return self
 end
 
@@ -186,9 +213,11 @@ function BlenderSyncManager:importAnimationFromBlender(livePreview: boolean?)
 
 	if responseBody then
 		-- The response is binary, so we pass `true`
-		local success = self.animationManager:loadAnimDataFromText(responseBody, true)
+		local success = self.animationManager:loadAnimDataFromText(responseBody, true, { applyRigChanges = true })
 		if success then
 			-- Don't set the hash here, it will be set in the polling loop
+			self:_confirmRigChanges((armature :: any).name)
+			self:_checkConfirmedJoints()
 		end
 		return success
 	else
@@ -245,7 +274,11 @@ function BlenderSyncManager:exportAnimationToBlender()
 	if State.selectedArmature:get() then
 		targetArmature = (State.selectedArmature:get() :: any).name
 	end
-	
+	-- The poses are relative to the joints the rig has: Blender needs them too.
+	if targetArmature and self.pendingRigConfirmation then
+		self:_confirmRigChanges(targetArmature)
+	end
+
 	local ok, message = self.blenderConnectionService:ExportAnimation(State.serverPort:get(), animData, targetArmature)
 	if not ok then
 		showProblem(message)
@@ -271,6 +304,108 @@ function BlenderSyncManager:_getRestCalibration(): any?
 		self.liveSyncRevision = ""
 	end
 	return self.restCalibration
+end
+
+--[=[
+	Tell Blender which of its queued joint changes the rig has now (see
+	RigChanges), so it rebases those bones and stops sending them. Until it
+	has, every export still lists them and Studio converts their poses, so
+	a failed confirmation only costs a retry: a few times here, then on the
+	next sync.
+]=]
+function BlenderSyncManager:_confirmRigChanges(armatureName: string)
+	local animationManager = self.animationManager :: any
+	local confirmations = if animationManager and animationManager.takeRigChangeConfirmations
+		then animationManager:takeRigChangeConfirmations()
+		else nil
+	if confirmations ~= nil then
+		-- A full load says what Blender still lists.
+		self.pendingRigConfirmation = if #confirmations > 0
+			then { armature = armatureName, outcomes = confirmations, attempts = 0 }
+			else nil
+	end
+	local pending = self.pendingRigConfirmation
+	if not pending or pending.armature ~= armatureName or self.isConfirmingRigChanges then
+		return
+	end
+
+	local entries = {}
+	for _, outcome in ipairs(pending.outcomes) do
+		table.insert(entries, outcome.change.entry)
+	end
+	self.isConfirmingRigChanges = true
+	local callOk, data, _kind, message = pcall(function()
+		return self.blenderConnectionService:ConfirmRigChanges(State.serverPort:get(), armatureName, entries)
+	end)
+	self.isConfirmingRigChanges = false
+	if self.pendingRigConfirmation ~= pending then
+		-- A newer load replaced it meanwhile.
+		return
+	end
+
+	for _, shown in ipairs(self.rigConfirmMessages) do
+		clearProblem(shown)
+	end
+	self.rigConfirmMessages = {}
+	local function show(text: string)
+		table.insert(self.rigConfirmMessages, text)
+		showProblem(text)
+	end
+
+	if not callOk or type(data) ~= "table" then
+		pending.attempts += 1
+		local reason = if callOk then message else data
+		show(string.format(
+			"Moved the joints Blender sent, but couldn't tell Blender (%s). Studio tries again on the next sync.",
+			tostring(reason or "no answer")
+		))
+		if pending.attempts < RIG_CONFIRM_ATTEMPTS then
+			task.delay(BlenderSyncManager.rigConfirmRetrySeconds, function()
+				self:_confirmRigChanges(armatureName)
+			end)
+		end
+		return
+	end
+
+	self.pendingRigConfirmation = nil
+	local byPart = {}
+	for _, outcome in ipairs(pending.outcomes) do
+		byPart[outcome.change.part1] = outcome
+	end
+	for _, part1 in ipairs(if type(data.applied) == "table" then data.applied else {}) do
+		local outcome = byPart[part1]
+		if outcome and outcome.joint then
+			self.confirmedRigJoints[outcome.joint] = outcome
+		end
+	end
+	for _, skipped in ipairs(if type(data.skipped) == "table" then data.skipped else {}) do
+		if type(skipped) == "table" then
+			show(string.format("Blender kept its old joint for %s: %s", tostring(skipped.part1), tostring(skipped.reason)))
+		end
+	end
+end
+
+-- A joint Blender rebased onto can be put back by an undo in Studio; then
+-- Blender's animation of it plays wrong here, so say so.
+function BlenderSyncManager:_checkConfirmedJoints()
+	local rig = State.activeRig :: any
+	local model = rig and rig.model
+	for joint, outcome in pairs(self.confirmedRigJoints) do
+		local message = RigChanges.describeUndone(outcome)
+		local inRig = joint.Parent ~= nil and model ~= nil and joint:IsDescendantOf(model)
+		if joint.Parent == nil then
+			self.confirmedRigJoints[joint] = nil
+		end
+		if inRig and RigChanges.isUndone(outcome) then
+			if not self.undoneJointMessages[message] then
+				self.undoneJointMessages[message] = true
+				showProblem(message)
+			end
+		elseif self.undoneJointMessages[message] then
+			self.undoneJointMessages[message] = nil
+			clearProblem(message)
+		end
+	end
 end
 
 function BlenderSyncManager:_drainLiveSyncUpdates(client: any)
@@ -359,6 +494,13 @@ function BlenderSyncManager:_handleWebSocketPayload(client: any, update: any)
 		if type(triggerHash) == "string" then
 			State.lastKnownBlenderAnimHash:set(triggerHash)
 		end
+		local armature = State.selectedArmature:get()
+		if armature then
+			task.spawn(function()
+				self:_confirmRigChanges((armature :: any).name)
+			end)
+		end
+		self:_checkConfirmedJoints()
 		if not self.liveSyncPreviewScheduled then
 			self.liveSyncPreviewScheduled = true
 			local delaySeconds = math.max(0, 0.1 - (os.clock() - self.lastLiveSyncPreviewBuild))
@@ -649,6 +791,10 @@ end
 function BlenderSyncManager:cleanup()
 	self:stopLiveSyncing()
 	self:cleanupServerConnection()
+	for _, connection in ipairs(self.historyConnections) do
+		connection:Disconnect()
+	end
+	table.clear(self.historyConnections)
 end
 
 return BlenderSyncManager

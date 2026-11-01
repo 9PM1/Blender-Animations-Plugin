@@ -2,10 +2,14 @@
 	Small rigs built from real Instances for the specs.
 ]=]
 
+local fs = require("@lune/fs")
 local roblox = require("@lune/roblox")
+local serde = require("@lune/serde")
 local Instance = require("./harness").Instance
 local CFrame = roblox.CFrame
 local Vector3 = roblox.Vector3
+
+local TEMPLATES = "roblox_animations/tests/fixtures/studio_templates.json"
 
 local Rigs = {}
 
@@ -64,6 +68,31 @@ function Rigs.r6(options)
 		rightLeg = rightLeg,
 		leftLeg = leftLeg,
 	}
+end
+
+-- A Studio template rig from the Blender tests' fixture: the parts and
+-- joints Blender imports, so Blender's joint values match this rig's.
+-- Parts are returned by name.
+function Rigs.template(name)
+	local fixture = serde.decode("json", fs.readFile(TEMPLATES))[name]
+	local model = Instance.new("Model")
+	model.Name = name
+	Instance.new("Humanoid").Parent = model
+	local parts = {}
+	for partName, components in fixture.parts do
+		parts[partName] = part(model, partName, CFrame.new(table.unpack(components, 1, 12)))
+	end
+	model.PrimaryPart = parts.HumanoidRootPart
+	for _, joint in fixture.joints do
+		motor(
+			parts[joint.part0],
+			parts[joint.part1],
+			joint.part1,
+			CFrame.new(table.unpack(joint.c0, 1, 12)),
+			CFrame.new(table.unpack(joint.c1, 1, 12))
+		)
+	end
+	return model, parts
 end
 
 return Rigs

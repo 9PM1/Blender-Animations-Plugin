@@ -453,6 +453,11 @@ def get_cached_armature_hash(armature_name):
     return cached[0]
 
 
+def forget_armature_hash(armature_name):
+    """Drop the cached hash, so the next status check sees a change made now."""
+    _action_hash_cache.pop(armature_name, None)
+
+
 def get_cached_armatures():
     """Get cached armature list or refresh if cache is stale"""
     global _armature_cache, _armature_cache_timestamp

@@ -243,7 +243,14 @@ local function newHttpService()
 end
 
 local function newChangeHistory()
-	local service = { recordings = {}, finished = {}, nextId = 0, busy = false }
+	local service = {
+		recordings = {},
+		finished = {},
+		nextId = 0,
+		busy = false,
+		OnUndo = newSignal(),
+		OnRedo = newSignal(),
+	}
 	function service:TryBeginRecording(name, _displayName)
 		if self.busy then
 			return nil

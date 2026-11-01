@@ -94,6 +94,14 @@ def _job_import(animation_data, target_armature):
     return _take_response(task_id)
 
 
+def _job_confirm_rig_changes(armature_name, changes):
+    from .requests import execute_confirm_rig_changes  # noqa: PLC0415
+
+    task_id = dispatch.new_task_id("rig")
+    execute_confirm_rig_changes(task_id, armature_name, changes)
+    return _take_response(task_id)
+
+
 class AnimationHandler(http.server.BaseHTTPRequestHandler):
     """HTTP request handler for the animation server endpoints."""
 
@@ -317,6 +325,26 @@ class AnimationHandler(http.server.BaseHTTPRequestHandler):
                 self.send_detailed_error(500, message)
                 return
             self._send_json(200, {"success": True, "message": message})
+            return
+
+        if path.startswith("/confirm_rig_changes/"):
+            # Studio applied these queued joint changes; rebase the bones.
+            armature_name = self._path_argument(path, "/confirm_rig_changes/")
+            request_data = self._json_body(body)
+            if request_data is _INVALID:
+                return
+            changes = request_data.get("changes")
+            if not armature_name or not isinstance(changes, list):
+                self.send_detailed_error(400, "Send the armature name and a 'changes' list.")
+                return
+            ok, result = self._run(_job_confirm_rig_changes, armature_name, changes)
+            if not ok:
+                return
+            success, data = result
+            if not success:
+                self.send_detailed_error(500, data)
+                return
+            self._send_json(200, dict(data, success=True))
             return
 
         self.send_detailed_error(404, "Not Found")

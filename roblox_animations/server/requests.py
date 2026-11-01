@@ -453,6 +453,48 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None, live_p
         pending_responses[task_id] = (False, f"Error during export: {str(e)}")
 
 
+def execute_confirm_rig_changes(task_id, armature_name, changes):
+    """Rebase the bones whose queued joint change the Studio rig has now.
+
+    Studio sends back the ``rig_changes`` entries it applied (see
+    ``pivots.confirm_studio_changes``); the next export is relative to the
+    new joints and no longer lists them.
+    """
+    try:
+        ao = get_object_by_name(armature_name) if armature_name else None
+        if not ao or ao.type != "ARMATURE":
+            pending_responses[task_id] = (False, f"Armature '{armature_name}' not found.")
+            return
+        if ao.mode == "EDIT":
+            # Bone properties set now would be lost when Edit Mode ends.
+            pending_responses[task_id] = (False, edit_mode_message(ao))
+            return
+
+        from ..rig import pivots
+
+        applied, skipped = pivots.confirm_studio_changes(ao, changes)
+        if applied:
+            # Status checks must see the new hash now, not after the cache expires.
+            utils.forget_armature_hash(ao.name)
+            print(
+                "Blender Addon: The Studio rig has the new joint for "
+                f"{', '.join(applied)}; exports are relative to it from now on."
+            )
+            # The panel counts the queued pivots.
+            window_manager = getattr(bpy.context, "window_manager", None)
+            for window in getattr(window_manager, "windows", ()):
+                for area in getattr(window.screen, "areas", ()):
+                    if area.type == "VIEW_3D":
+                        area.tag_redraw()
+        for entry in skipped:
+            print(f"Blender Addon: Kept the joint for {entry['part1']}: {entry['reason']}.")
+        pending_responses[task_id] = (True, {"applied": applied, "skipped": skipped})
+
+    except Exception as e:
+        traceback.print_exc()
+        pending_responses[task_id] = (False, f"Error confirming joint changes: {str(e)}")
+
+
 def _seconds_scale(export_info, scene_fps):
     """Factor that converts payload times to seconds."""
     if isinstance(export_info, dict) and export_info.get("time_unit") == "frames":

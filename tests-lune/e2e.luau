@@ -10,9 +10,11 @@
 
 local net = require("@lune/net")
 local process = require("@lune/process")
+local roblox = require("@lune/roblox")
 local task = require("@lune/task")
 local H = require("./harness")
 local Rigs = require("./rigs")
+local CFrame = roblox.CFrame
 
 local port = tonumber(process.args[1]) or 31337
 local armatureName = process.args[2] or "__TemplateR6_Armature"
@@ -89,6 +91,87 @@ describe("end to end", function()
 			keyed += 1
 		end
 		H.expectTrue(keyed >= 2, "Right Arm keyed")
+	end)
+
+	it("a pivot written to the Studio rig: Studio applies it, Blender rebases", function()
+		local State = env.require("state")
+		local RigManager = env.require("Services.RigManager")
+		local AnimationManager = env.require("Services.AnimationManager")
+		local BlenderSyncManager = env.require("Services.BlenderSyncManager")
+		State.rigManager = RigManager.new({ stopRigTrack = function() end }, nil)
+		local model, parts = Rigs.template("TemplateR6")
+		State.activeRigModel = model
+		State.activeRig = Rig.new(model)
+		State.serverPort:set(port)
+		State.selectedArmature:set({ name = armatureName })
+		local sync = BlenderSyncManager.new({}, AnimationManager.new({ playAllRigs = function() end }, nil))
+		sync.blenderConnectionService = connection
+
+		local function export()
+			local body, kind, message = connection:ImportAnimation(port, armatureName, nil, false)
+			H.expectTrue(body ~= nil, "export body (" .. tostring(kind) .. ": " .. tostring(message) .. ")")
+			return AnimationSerializer.new():deserialize(body, true)
+		end
+		local function status(hash)
+			task.wait(0.15) -- one status check per 0.1 s
+			return connection:CheckAnimationStatus(port, armatureName, hash)
+		end
+		local function cframe(components)
+			return CFrame.new(table.unpack(components, 1, 12))
+		end
+		local function expectSameCFrame(actual, expected, label)
+			local a, b = { actual:GetComponents() }, { expected:GetComponents() }
+			for index = 1, 12 do
+				H.expectNear(a[index], b[index], 1e-4, string.format("%s [%d]", label, index))
+			end
+		end
+
+		local before = export()
+		local change = before.rig_changes and before.rig_changes[1]
+		H.expectTrue(change ~= nil and change.part1 == "Left Arm" and change.part0 == "Torso", "Blender lists the change")
+		local hash = status("").hash
+		local shoulder = parts.Torso:FindFirstChild("Left Arm")
+
+		H.expectTrue(sync:importAnimationFromBlender(), "synced from Blender")
+
+		expectSameCFrame(shoulder.C0, cframe(change.c0), "C0")
+		expectSameCFrame(shoulder.C1, cframe(change.c1), "C1")
+		expectSameCFrame(parts.Torso.CFrame * shoulder.C0 * shoulder.C1:Inverse(), parts["Left Arm"].CFrame, "parts stay put")
+		local shown = table.concat(State.activeWarnings:get(), " | ")
+		H.expectContains(shown, "Moved the Left Arm joint", "note")
+		H.expectTrue(not string.find(shown, "couldn't tell Blender", 1, true), "confirmed: " .. shown)
+
+		-- Studio confirmed it: Blender rebased the bone onto the new joint.
+		H.expectTrue(status(hash).has_update, "Blender changed")
+		local after = export()
+		H.expectEqual(after.rig_changes, nil, "the change is no longer listed")
+		local scale = if after.export_info and after.export_info.time_unit == "frames" then 1 / after.export_info.fps else 1
+		local poses = State.activeRig.bones["Left Arm"].poses
+		local function studioPose(time)
+			for poseTime, pose in poses do
+				if math.abs(poseTime - time) < 1e-4 then
+					return pose.transform
+				end
+			end
+			return nil
+		end
+		local keysBefore, keysAfter = 0, 0
+		for _, keyframe in before.kfs do
+			if keyframe.kf["Left Arm"] then
+				keysBefore += 1
+			end
+		end
+		for _, keyframe in after.kfs do
+			local pose = keyframe.kf["Left Arm"]
+			if pose then
+				keysAfter += 1
+				-- Studio played the export it applied the way Blender sends it now.
+				local played = studioPose(keyframe.t * scale)
+				H.expectTrue(played ~= nil, "Studio has a key at " .. keyframe.t)
+				expectSameCFrame(played, cframe(pose[1]), "pose at " .. keyframe.t)
+			end
+		end
+		H.expectTrue(keysAfter >= 2 and keysAfter < keysBefore, string.format("sparse keys again (%d -> %d)", keysBefore, keysAfter))
 	end)
 
 	it("Studio -> Blender: import reports what it did", function()

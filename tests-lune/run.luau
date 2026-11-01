@@ -13,6 +13,7 @@ local specs = {
 	require("./specs/studio_rig.spec"),
 	require("./specs/studio_sync.spec"),
 	require("./specs/studio_services.spec"),
+	require("./specs/studio_rig_changes.spec"),
 }
 
 for _, spec in specs do

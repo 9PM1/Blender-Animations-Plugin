@@ -292,6 +292,36 @@ function BlenderConnection:ExportAnimation(port: number, animationData: any, tar
 	return true, summary
 end
 
+-- Send back the `rig_changes` entries the Studio rig has now, so Blender
+-- rebases those bones. Returns Blender's answer ({ applied, skipped }).
+function BlenderConnection:ConfirmRigChanges(port: number, armatureName: string, changes: { any }): (any, string?, string?)
+	if not validPort(port) then
+		return nil, "error", "Invalid port."
+	end
+	if type(armatureName) ~= "string" or #armatureName == 0 then
+		return nil, "error", "No armature selected."
+	end
+
+	local response, kind, message = self:_request(port, {
+		Url = string.format("%s/confirm_rig_changes/%s", baseUrl(port), self.HttpService:UrlEncode(armatureName)),
+		Method = "POST" :: HttpMethod,
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = self.HttpService:JSONEncode({ changes = changes }),
+		Compress = Enum.HttpCompression.None,
+	})
+	if not response then
+		return nil, kind, message
+	end
+
+	local decodeSuccess, data = pcall(function()
+		return self.HttpService:JSONDecode(response.Body)
+	end)
+	if not decodeSuccess or type(data) ~= "table" then
+		return nil, "error", "Blender sent an answer Studio couldn't read."
+	end
+	return data, nil, nil
+end
+
 function BlenderConnection:CheckAnimationStatus(port: number, armatureName: string, lastKnownHash: string): (any, string?, string?)
 	if not validPort(port) then
 		return nil, "error", "Invalid port."
