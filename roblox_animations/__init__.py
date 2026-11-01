@@ -173,6 +173,8 @@ _classes = [
     # World-space unparent
     _resolve_operator_class("OBJECT_OT_WorldSpaceUnparent"),
     _resolve_operator_class("OBJECT_OT_WorldSpaceReparent"),
+    # Keyable parent switching
+    _resolve_operator_class("OBJECT_OT_ParentSwitch", fallback_module="parent_switch_ops"),
     # Animation operators
     _resolve_operator_class("OBJECT_OT_ApplyTransform"),
     _resolve_operator_class("OBJECT_OT_MapKeyframes"),

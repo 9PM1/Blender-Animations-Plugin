@@ -1064,6 +1064,12 @@ def _has_any_keys(ao, bone_names):
 
 def _sample_world_matrices(ao, bone_names, frame_start, frame_end, substeps=1):
     """Sample evaluated armature-space matrices, including hidden controls."""
+    frames = _worldspace_sample_frames(ao, frame_start, frame_end, substeps)
+    return _sample_pose_matrices(ao, bone_names, frames)
+
+
+def _sample_pose_matrices(ao, bone_names, frames):
+    """Evaluated armature-space matrices at the given frames."""
     from ..core.evaluation import rig_evaluation_context
 
     scene = bpy.context.scene
@@ -1071,7 +1077,7 @@ def _sample_world_matrices(ao, bone_names, frame_start, frame_end, substeps=1):
     orig_frame, orig_subframe = scene.frame_current, scene.frame_subframe
     try:
         with rig_evaluation_context(ao):
-            for f in _worldspace_sample_frames(ao, frame_start, frame_end, substeps):
+            for f in frames:
                 scene.frame_set(int(f // 1), subframe=f % 1)
                 bpy.context.view_layer.update()
                 evaluated = ao.evaluated_get(bpy.context.evaluated_depsgraph_get())
@@ -1578,6 +1584,12 @@ class OBJECT_OT_WorldSpaceReparent(bpy.types.Operator):
         frame_start, frame_end = _get_action_frame_range(ao)
         all_world_mats = _sample_world_matrices(ao, bone_names, frame_start, frame_end, substeps=4)
         world_mats = {name: all_world_mats[name] for name in bones_edited}
+
+        # A parent-switch constraint stood in for the parent link. The motion
+        # sampled above includes it.
+        from ..animation.parent_switch import remove_follow_constraints
+        for name in bone_names:
+            remove_follow_constraints(ao, ao.pose.bones[name])
 
         bpy.ops.object.mode_set(mode="EDIT")
 

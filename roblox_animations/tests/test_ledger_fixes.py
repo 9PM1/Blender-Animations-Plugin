@@ -46,9 +46,10 @@ R6_SIZES = {
 }
 
 
-def r6_binary(sizes=R6_SIZES):
-    """The Studio R6 template as an .rbxm, with real part sizes."""
-    fixture = templates()["TemplateR6"]
+def r6_binary(sizes=R6_SIZES, fixture=None):
+    """The Studio R6 template (or a variant of it) as an .rbxm, with real part sizes."""
+    if fixture is None:
+        fixture = templates()["TemplateR6"]
     names = list(fixture["parts"])
     refs = {name: index + 1 for index, name in enumerate(names)}
     joints = fixture["joints"]
