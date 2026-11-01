@@ -14,6 +14,7 @@ _STRUCTURAL_KEYS = (
     "is_deform_rig",
     "bone_hierarchy",
     "export_info",
+    "rig_changes",
 )
 
 

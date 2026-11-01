@@ -175,6 +175,14 @@ _classes = [
     _resolve_operator_class("OBJECT_OT_WorldSpaceReparent"),
     # Keyable parent switching
     _resolve_operator_class("OBJECT_OT_ParentSwitch", fallback_module="parent_switch_ops"),
+    # Pivots, bone shapes and animation controls
+    _resolve_operator_class("OBJECT_OT_PivotToCursor"),
+    _resolve_operator_class("OBJECT_OT_ResetPivot"),
+    _resolve_operator_class("OBJECT_OT_SetBoneShape"),
+    _resolve_operator_class("OBJECT_OT_WritePivotToStudio"),
+    _resolve_operator_class("OBJECT_OT_KeepPivotInBlender"),
+    _resolve_operator_class("OBJECT_OT_AddControls"),
+    _resolve_operator_class("OBJECT_OT_RemoveControls"),
     # Animation operators
     _resolve_operator_class("OBJECT_OT_ApplyTransform"),
     _resolve_operator_class("OBJECT_OT_MapKeyframes"),

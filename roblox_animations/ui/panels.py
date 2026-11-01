@@ -19,7 +19,7 @@ from ..animation.face_controls import (
 )
 from ..animation.serialization import is_deform_bone_rig
 from ..server.server import get_server_status
-from ..core.utils import get_object_by_name
+from ..core.utils import PENDING_STUDIO_PIVOT_PROP, get_object_by_name, is_control_bone
 
 
 def _load_addon_version_text():
@@ -208,6 +208,7 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
                 and "transform1" in bone.bone
                 and "nicetransform" in bone.bone
             )
+            and not is_control_bone(bone)
             for bone in selected_armature.pose.bones
         )
         is_skinned_rig = is_deform_bone_rig(selected_armature)
@@ -315,6 +316,48 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
                 note.scale_y = 0.7
                 note.label(text="Baked compensation follows only", icon="INFO")
                 note.label(text="this animation's parent motion.", icon="BLANK1")
+
+        # Animation controls, pivots and handle shapes.
+        from ..rig import controls as rig_controls
+
+        col.separator()
+        controls_row = col.row(align=True)
+        if rig_controls.has_controls(selected_armature):
+            controls_row.operator(
+                "object.rbxanims_remove_controls", text="Remove Controls", icon="X"
+            )
+        else:
+            controls_row.operator(
+                "object.rbxanims_add_controls", text="Add Controls", icon="CON_KINEMATIC"
+            )
+        pivot_row = col.row(align=True)
+        pivot_row.label(text="Pivot:", icon="PIVOT_CURSOR")
+        pivot_row.operator("object.rbxanims_pivot_to_cursor", text="To Cursor")
+        pivot_row.operator("object.rbxanims_reset_pivot", text="Reset")
+        studio_row = col.row(align=True)
+        studio_row.operator(
+            "object.rbxanims_write_pivot_to_studio", text="Write to Studio Rig", icon="EXPORT"
+        )
+        studio_row.operator(
+            "object.rbxanims_keep_pivot_in_blender", text="", icon="CANCEL"
+        )
+        queued = sum(
+            1 for bone in selected_armature.data.bones if bone.get(PENDING_STUDIO_PIVOT_PROP)
+        )
+        if queued:
+            col.label(
+                text=f"{queued} pivot change(s) queued for the Studio rig",
+                icon="TIME",
+            )
+        shape_row = col.row(align=True)
+        shape_row.label(text="Shape:")
+        for shape, icon in (
+            ("SPHERE", "MESH_UVSPHERE"),
+            ("RING", "MESH_CIRCLE"),
+            ("ARROW", "EMPTY_SINGLE_ARROW"),
+            ("NONE", "BONE_DATA"),
+        ):
+            shape_row.operator("object.rbxanims_bone_shape", text="", icon=icon).shape = shape
 
         # Show IK-FK slider if an IK target with the property is selected
         if selected_ik_target:

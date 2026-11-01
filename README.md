@@ -35,6 +35,9 @@ A powerful Roblox Studio plugin that enables seamless animation workflow between
 - **Animation Scaling**: Adjust scale factors in the Tools tab
 - **Camera Controls**: Attach a camera to a part, such as the head. Useful for viewport animations.
 - **Easing Transfer**: Easing transfers losslessly between Roblox and Blender where possible.
+- **Animation Controls**: In Blender, "Add Controls" builds IK hands and feet with elbow and knee poles, a root mover and a grip handle on each hand, in their own bone collection. The export bakes what the controls show; "Remove Controls" gives back the plain rig, optionally baking the controls' motion onto the bones.
+- **Custom Pivots**: Move a bone's rotation pivot (to the 3D cursor, or its head in Edit Mode) and draw bones as sphere, ring or arrow handles; the parts and the export stay put. "Write to Studio Rig" queues the matching C0/C1 change in every export for the Studio plugin (which doesn't apply it yet).
+- **Parent Switching**: In Blender, key whether a bone follows its parent, so a sword can leave the hand and be caught again, or a torso can turn on its own; the export compensates, and can add ParentSwitch markers for game code. A control can switch too, such as a hand grip that stays put while the root mover walks on. Bones the controls drive switch through their control.
 
 ## Configuration
 

@@ -25,6 +25,7 @@ from .rig_ops import (
     _rotation_data_path,
     _sample_pose_matrices,
     _sample_world_matrices,
+    _skip_controlled,
     _snapshot_bone_fcurves,
     _store_fcurve_snapshot,
 )
@@ -351,6 +352,10 @@ class OBJECT_OT_ParentSwitch(bpy.types.Operator):
         if not names:
             self.report({"WARNING"}, "Select a bone that has a parent")
             return {"CANCELLED"}
+        names, note = _skip_controlled(ao, names)
+        if not names:
+            self.report({"WARNING"}, note)
+            return {"CANCELLED"}
 
         scene = context.scene
         frame = scene.frame_current
@@ -361,5 +366,9 @@ class OBJECT_OT_ParentSwitch(bpy.types.Operator):
             states.append(f"{name} {'follows its parent' if follows else 'is free'}")
         # Show the keyed result rather than the values set while keying.
         scene.frame_set(frame)
-        self.report({"INFO"}, f"From frame {frame}: " + ", ".join(states))
+        message = f"From frame {frame}: " + ", ".join(states)
+        if note:
+            self.report({"WARNING"}, f"{message}. {note}")
+        else:
+            self.report({"INFO"}, message)
         return {"FINISHED"}

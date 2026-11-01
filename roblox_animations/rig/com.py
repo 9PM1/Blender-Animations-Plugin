@@ -14,6 +14,8 @@ from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 from typing import Optional, Dict, Tuple
 
+from ..core.utils import is_control_bone
+
 # Default bone weights for R15 rigs
 DEFAULT_BONE_WEIGHTS_R15 = {
     "HumanoidRootPart": 0.0,
@@ -270,9 +272,9 @@ def calculate_com(armature: "bpy.types.Object") -> Vector:
     matrix_world = armature.matrix_world
 
     for pose_bone in armature.pose.bones:
-        # Skip IK helper bones
+        # Skip IK helper bones and animation controls (they have no mass)
         bone_name = pose_bone.name
-        if any(bone_name.endswith(suffix) for suffix in _IK_SUFFIXES):
+        if any(bone_name.endswith(suffix) for suffix in _IK_SUFFIXES) or is_control_bone(pose_bone):
             continue
 
         # Get bone weight (custom or default)

@@ -12,6 +12,7 @@ import bpy
 from mathutils import Matrix
 
 from ..core.constants import get_transform_to_blender
+from ..core.utils import is_control_bone
 from .face_controls import is_face_control_bone
 
 _SCALE_EPSILON = 1e-6
@@ -155,7 +156,7 @@ def extract_deform_rest_scale_samples(
     sorted_bones = sorted(ao.pose.bones, key=lambda bone: len(bone.parent_recursive))
 
     for pose_bone in sorted_bones:
-        if is_face_control_bone(pose_bone):
+        if is_face_control_bone(pose_bone) or is_control_bone(pose_bone):
             continue
 
         rest_matrix = _orthonormalized_transform(

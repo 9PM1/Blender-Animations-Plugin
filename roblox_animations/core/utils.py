@@ -151,6 +151,22 @@ def pose_bone_set_hidden(pose_bone, value):
         pose_bone.hide = hidden
 
 
+# Data-bone property marking an animation control (or its hidden mechanism):
+# controls drive the joint bones but are never exported or synced as channels.
+CONTROL_BONE_PROP = "rbx_control"
+# Data-bone flag: write this joint bone's custom pivot to the Studio rig's
+# Motor6D (see rig/pivots.py).
+PENDING_STUDIO_PIVOT_PROP = "rbx_pending_studio_pivot"
+
+
+def is_control_bone(bone_like) -> bool:
+    data_bone = getattr(bone_like, "bone", bone_like)
+    try:
+        return bool(data_bone.get(CONTROL_BONE_PROP))
+    except Exception:
+        return False
+
+
 def get_action_channelbag(action, slot=None):
     """Return the ensured channelbag for an action slot, with legacy fallbacks.
 
@@ -408,7 +424,17 @@ def get_armature_timeline_hash(armature_name):
     for bone in obj.data.bones:
         parent_name = bone.parent.name if bone.parent else ""
         rest = tuple(round(value, 5) for row in bone.matrix_local for value in row)
-        hash_parts.append(f"B:{bone.name}:{parent_name}:{rest}")
+        # A queued or applied Studio joint change alters the export without
+        # moving the rest.
+        joint = tuple(
+            round(value, 5)
+            for key in ("transform0", "transform1", "nicetransform")
+            if key in bone
+            for row in to_matrix(bone[key])
+            for value in row
+        )
+        pending = bool(bone.get(PENDING_STUDIO_PIVOT_PROP, False))
+        hash_parts.append(f"B:{bone.name}:{parent_name}:{rest}:{joint}:{pending}")
 
     hash_parts.append(get_timeline_hash())
     return hashlib.md5("|".join(hash_parts).encode("utf-8")).hexdigest()

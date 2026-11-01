@@ -31,6 +31,13 @@ from .rig_ops import (
     OBJECT_OT_ToggleWeldBones,
     OBJECT_OT_WorldSpaceUnparent,
     OBJECT_OT_WorldSpaceReparent,
+    OBJECT_OT_PivotToCursor,
+    OBJECT_OT_ResetPivot,
+    OBJECT_OT_SetBoneShape,
+    OBJECT_OT_WritePivotToStudio,
+    OBJECT_OT_KeepPivotInBlender,
+    OBJECT_OT_AddControls,
+    OBJECT_OT_RemoveControls,
 )
 from .parent_switch_ops import OBJECT_OT_ParentSwitch
 from .animation_ops import (
@@ -90,6 +97,13 @@ __all__ = [
     "OBJECT_OT_WorldSpaceReparent",
     # Parent switching
     "OBJECT_OT_ParentSwitch",
+    "OBJECT_OT_PivotToCursor",
+    "OBJECT_OT_ResetPivot",
+    "OBJECT_OT_SetBoneShape",
+    "OBJECT_OT_WritePivotToStudio",
+    "OBJECT_OT_KeepPivotInBlender",
+    "OBJECT_OT_AddControls",
+    "OBJECT_OT_RemoveControls",
     # Animation operators
     "OBJECT_OT_ApplyTransform",
     "OBJECT_OT_MapKeyframes",

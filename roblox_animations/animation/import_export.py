@@ -126,6 +126,16 @@ def import_animation_preserve_ik(import_fn, *args, **kwargs):
     if not ao or ao.type != 'ARMATURE':
         return import_fn(*args, **kwargs)
 
+    from ..rig import controls  # noqa: PLC0415
+
+    if controls.has_controls(ao):
+        # "Add controls" rigs: the imported keys land on the joint bones and
+        # the controls are keyed to reproduce them.
+        result = import_fn(*args, **kwargs)
+        scene = bpy.context.scene
+        controls.match_controls_to_pose(ao, range(scene.frame_start, scene.frame_end + 1))
+        return result
+
     scene = bpy.context.scene
     frame_start = scene.frame_start
     frame_end = scene.frame_end
